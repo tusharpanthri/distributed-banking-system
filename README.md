@@ -1,584 +1,232 @@
-Lab 3 - Distributed Systems
-# Distributed Banking System
+# Distributed Banking System — Paxos + Two-Phase Commit
 
-A distributed banking system implementing **Paxos consensus protocol** and **Two-Phase Commit (2PC)** for transaction management across multiple clusters and servers. This system ensures consistency, fault tolerance, and atomicity in a distributed environment.
+A sharded, replicated bank ledger in Go. Accounts are partitioned across clusters; each cluster is replicated across several servers. **Paxos** keeps the replicas within a cluster agreed on one ordered log, and **two-phase commit** makes a transfer that spans two clusters atomic across both.
 
-## Table of Contents
+It started as a graduate distributed-systems lab. This version fixes several safety bugs in the original — the interesting part of the repo is arguably
 
-- [Overview](#overview)
-- [Architecture](#architecture)
-- [Key Features](#key-features)
-- [Technologies Used](#technologies-used)
-- [Project Structure](#project-structure)
-- [Core Components](#core-components)
-- [How It Works](#how-it-works)
-- [Transaction Types](#transaction-types)
-- [Consensus Protocols](#consensus-protocols)
-- [Database Schema](#database-schema)
-- [Setup Instructions](#setup-instructions)
-- [Usage](#usage)
-- [Performance Metrics](#performance-metrics)
+---
 
-## Overview
+## Contents
 
-This distributed banking system simulates a multi-cluster, multi-server banking environment where:
+- [How it works](#how-it-works)
+- [Quickstart](#quickstart)
+- [Running the tests](#running-the-tests)
+- [Failure demos](#failure-demos)
+- [Screenshots](#screenshots)
+- [What changed and why](#what-changed-and-why)
+- [Limitations](#limitations)
+- [Project layout](#project-layout)
 
-- **Data is sharded** across multiple clusters
-- Each cluster contains **multiple replica servers** for fault tolerance
-- Transactions can be **intra-shard** (within the same cluster) or **cross-shard** (across different clusters)
-- **Paxos protocol** ensures consensus within clusters
-- **Two-Phase Commit (2PC)** ensures atomicity for cross-shard transactions
-- The system maintains **ACID properties** in a distributed setting
+---
 
-## Architecture
+## How it works
 
-### System Design
+### Topology
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Client Application                        │
-│                    (main.go)                                 │
-└──────────────────────┬──────────────────────────────────────┘
-                       │
-        ┌──────────────┴──────────────┐
-        │                             │
-   ┌────▼────┐                  ┌────▼────┐
-   │ Cluster │                  │ Cluster │
-   │    C1   │                  │    C2   │
-   └────┬────┘                  └────┬────┘
-        │                             │
-   ┌────┴────┐                   ┌────┴────┐
-   │ Server  │                   │ Server  │
-   │   S1    │                   │   S4    │
-   │ Server  │                   │ Server  │
-   │   S2    │                   │   S5    │
-   │ Server  │                   │ Server  │
-   │   S3    │                   │   S6    │
-   └─────────┘                   └─────────┘
-```
+You pick the cluster count and replicas per cluster at startup. Accounts are split into contiguous ranges, one per cluster. The default configuration:
 
-### Key Concepts
+| Cluster | Accounts | Replicas | Quorum |
+|---------|----------|----------|--------|
+| C1 | 1–1000 | S1, S2, S3 | 2 of 3 |
+| C2 | 1001–2000 | S4, S5, S6 | 2 of 3 |
+| C3 | 2001–3000 | S7, S8, S9 | 2 of 3 |
 
-- **Clusters**: Groups of servers that replicate the same data shards
-- **Shards**: Data partitions (client accounts) distributed across clusters
-- **Quorum**: Minimum number of servers needed for consensus (majority: `(N+1)/2`)
-- **Leader**: Server that initiates Paxos phases
-- **Contact Server**: Designated server in each cluster for handling transactions
+Every account starts with a balance of 10. Server `S<n>` listens on `localhost:500<n>` and keeps its own SQLite file (`db_S<n>.db`) holding a `clients` table (balance + lock flag) and a `transactions` table (the replicated log).
 
-## Key Features
+Workload comes from a CSV of transaction *sets*. Each set names the transfers plus two lists: which servers are active, and which server is the contact (leader) for each cluster.
 
-1. **Distributed Consensus**
-   - Paxos protocol implementation for cluster-level consensus
-   - Quorum-based voting mechanism
-   - Leader election through ballot numbers
+### Intra-shard transfer — Paxos only
 
-2. **Cross-Shard Transaction Support**
-   - Two-Phase Commit (2PC) protocol
-   - Atomic commit/abort across multiple clusters
-   - Transaction status tracking (Pending "P", Committed "C")
+When both accounts live in the same cluster, the contact server runs one Paxos round:
 
-3. **Fault Tolerance**
-   - Replication across multiple servers per cluster
-   - Automatic recovery from longest transaction history
-   - Graceful handling of server failures
+1. **Ballot.** The leader picks a ballot strictly above anything it has seen: `Ballot{Number, ServerID}`, ordered by number then server.
+2. **Prepare.** Broadcast to all replicas in parallel. An acceptor promises only if the ballot is strictly greater than its current promise, and its reply carries whatever it has already accepted.
+3. **Count.** The leader proceeds only on a strict majority of promises. It adopts the value accepted under the highest ballot in that quorum — its own log is not automatically the winner.
+4. **Local check.** Sender unlocked and solvent → lock both accounts.
+5. **Accept.** Broadcast the proposal stamped with the ballot. Acceptors reject anything below their promise.
+6. **Count again.** Only a majority of accepts makes the value *chosen*. Short of that, the leader releases its locks and gives up.
+7. **Commit.** Apply locally, then broadcast so the rest of the cluster applies it too.
 
-4. **Data Consistency**
-   - Client locking mechanism to prevent concurrent modifications
-   - Balance validation before transaction execution
-   - Transaction history synchronization
+### Cross-shard transfer — Paxos under 2PC
 
-5. **Performance Monitoring**
-   - Transaction latency tracking
-   - Throughput calculation
-   - Performance metrics reporting
+When the accounts live in different clusters, each side runs its own Paxos round in parallel:
 
-## Technologies Used
+- **Source cluster** — reach quorum, verify funds, lock the sender, debit it, write the entry with status `P` (prepared), and **keep the lock held**.
+- **Destination cluster** — reach quorum, lock the receiver, credit it, write status `P`, **lock held**.
 
-- **Go 1.23.2**: Primary programming language
-- **SQLite3**: Embedded database for persistent storage
-- **RPC (net/rpc)**: Inter-server communication
-- **UUID**: Unique transaction ID generation
-- **CSV Parser**: Test case input processing
+Each side reaching quorum is that shard's **yes vote**. A shard that loses quorum, finds the account locked, or finds insufficient funds votes no.
 
-## Project Structure
+The coordinator then applies the 2PC rule — unanimity or abort — and broadcasts the decision to every replica in both clusters:
 
-```
-distributed-banking/
-├── main.go                    # Main application entry point
-├── go.mod                     # Go module dependencies
-├── go.sum                     # Dependency checksums
-│
-├── client/                    # Client-side RPC communication
-│   └── client.go             # Transaction sending functions
-│
-├── server/                    # Server implementation
-│   └── server.go             # Server RPC handlers and logic
-│
-├── database/                  # Database layer
-│   ├── database.go           # Database initialization
-│   └── util.go               # Database utility functions
-│
-├── paxos/                     # Paxos consensus protocol
-│   └── paxos.go              # Prepare, Accept, Commit phases
-│
-├── csv_parser/                # CSV test case parser
-│   └── csv_parser.go         # Parse transaction sets from CSV
-│
-├── shared/                    # Shared types and utilities
-│   ├── types.go              # Common data structures
-│   ├── transaction.go        # Transaction type definition
-│   ├── shared.go             # Quorum calculation
-│   ├── serveraddress.go      # Server address mapping
-│   ├── servertoclusteridmap.go # Server-to-cluster mapping
-│   ├── contactserverforclusterid.go # Contact server selection
-│   ├── preparerequest.go     # Paxos prepare request type
-│   ├── filteractiveservers.go # Server filtering utilities
-│   ├── caluculatenewshards.go # Shard redistribution logic
-│   ├── serverstatus.go       # Server status tracking
-│   └── transactionqueue.go   # Transaction queue implementation
-│
-└── test_data/                 # Test case files
-    ├── guide.csv
-    ├── lab1_Test.csv
-    └── New_Test_Cases_-_Lab3.csv
+- **`2PCcommit`** → flip the entry to `C`, release locks. The money has moved.
+- **`2PCabort`** → reverse the balance change, release locks.
+
+---
+
+## Quickstart
+
+Requires Go 1.25+. No C toolchain: the SQLite driver is pure Go, so everything builds with `CGO_ENABLED=0`.
+
+```bash
+cd distributed-banking && go run .
 ```
 
-## Core Components
-
-### 1. Main Application (`main.go`)
-
-The orchestrator that:
-- Configures cluster and server topology
-- Assigns data shards to clusters
-- Parses CSV test cases
-- Routes transactions (intra-shard vs cross-shard)
-- Manages 2PC commit/abort sequences
-- Provides interactive commands for system inspection
-
-**Key Functions:**
-- `ConfigureClusters()`: User input for cluster configuration
-- `InitializeClusters()`: Creates server-to-cluster mapping
-- `AssignShardsToClusters()`: Distributes data shards
-- `PrintBalance()`: Query client balance across replicas
-- `PrintDatastore()`: Display all committed transactions
-- `PrintPerformance()`: Show latency and throughput metrics
-
-### 2. Server (`server/server.go`)
-
-Handles all server-side operations:
-
-**RPC Methods:**
-- `HandleTransaction()`: Processes intra-shard transactions
-- `HandleCrossShardTransaction()`: Processes cross-shard transactions
-- `Handle2PCCommit()`: Handles 2PC commit/abort messages
-- `Prepare()`: Paxos prepare phase handler
-- `AcceptTransactions()`: Paxos accept phase handler
-- `CommitTransactions()`: Paxos commit phase handler
-- `GetBalance()`: Retrieves client balance
-- `CommittedTransactionsInDB()`: Returns transaction history
-- `FetchBallotNumber()`: Returns current ballot number
-
-**Key Features:**
-- Thread-safe operations using mutex locks
-- Transaction history synchronization
-- Client locking mechanism
-- Balance validation
-- Automatic recovery from longest history
-
-### 3. Client (`client/client.go`)
-
-Client-side RPC communication:
-
-**Functions:**
-- `ConnectToServer()`: Establishes RPC connection
-- `SendIntraShardTransaction()`: Sends intra-shard transaction
-- `SendCrossShardTransaction()`: Sends cross-shard transaction
-- `Send2PCCommit()`: Sends 2PC commit/abort message
-
-### 4. Paxos Protocol (`paxos/paxos.go`)
-
-Implements the three-phase Paxos consensus:
-
-**Phases:**
-1. **FetchLongestTransactionHistory()**: Discovers the longest committed transaction history from active servers
-2. **PreparePhase()**: Leader sends prepare requests with longest history
-3. **AcceptPhase()**: Leader sends transaction for acceptance
-4. **CommitPhase()**: Leader commits transaction to all replicas
-
-### 5. Database Layer (`database/`)
-
-SQLite-based persistence:
-
-**Tables:**
-- `clients`: Client balances and locks
-- `transactions`: Transaction history with status
-
-**Operations:**
-- Balance management (get, update)
-- Lock management (set, unset, check)
-- Transaction CRUD operations
-- Transaction history retrieval
-
-### 6. CSV Parser (`csv_parser/csv_parser.go`)
-
-Parses test case files with format:
-```
-SetNumber, Transaction, ActiveServers, ContactServers
-1, (1,2,10), [S1,S2,S3], [S1,S4]
-```
-
-**Output:**
-- Array of transaction sets
-- Each set contains transactions, active servers, and contact servers
-
-## How It Works
-
-### System Initialization
-
-1. **Configuration**: User specifies number of clusters and servers per cluster
-2. **Cluster Setup**: Servers are assigned to clusters (e.g., S1-S3 → C1, S4-S6 → C2)
-3. **Shard Assignment**: Data shards (client IDs) are distributed across clusters
-4. **Server Startup**: Each server starts RPC listener on port `5000 + serverNumber`
-5. **Database Initialization**: Each server creates SQLite database with assigned shards (initial balance: 10)
-
-### Transaction Processing Flow
-
-#### Intra-Shard Transaction
+You will be prompted for the number of clusters and servers per cluster (3 and 3 reproduces the table above). The system then walks through the CSV one set at a time, pausing at a menu after each:
 
 ```
-Client → Contact Server (Leader)
-         ↓
-   1. Fetch longest history from replicas
-   2. Update local DB with missing transactions
-   3. Prepare Phase (send longest history to replicas)
-   4. Check quorum
-   5. Lock clients & validate balance
-   6. Accept Phase (send transaction to replicas)
-   7. Commit locally
-   8. Commit Phase (notify replicas)
-```
-
-#### Cross-Shard Transaction
-
-```
-Client → Source Contact Server (async) ──┐
-Client → Dest Contact Server (async)   ──┼─→ Both complete
-                                          │
-                                          ↓
-                                   2PC Decision
-                                          │
-                    ┌────────────────────┴────────────────────┐
-                    ↓                                          ↓
-           2PC Commit/Abort                           2PC Commit/Abort
-         (Source Cluster)                            (Dest Cluster)
-```
-
-**Cross-Shard Steps:**
-1. Both source and destination clusters process transaction independently
-2. Source: Locks sender, validates balance, deducts amount
-3. Destination: Locks receiver, adds amount
-4. Both mark transaction as "P" (Pending)
-5. After both succeed, 2PC coordinator sends commit/abort
-6. On commit: Unlock clients, mark as "C" (Committed)
-7. On abort: Rollback balances, unlock clients
-
-### Paxos Consensus Protocol
-
-**Purpose**: Ensure all servers in a cluster agree on transaction order
-
-**Process:**
-1. **Leader Election**: Server with highest ballot number becomes leader
-2. **Prepare Phase**: 
-   - Leader fetches longest history from all replicas
-   - Sends prepare request with longest history and new ballot number
-   - Replicas update their history and ballot number
-3. **Accept Phase**:
-   - Leader sends transaction to all replicas
-   - Replicas lock clients and validate
-4. **Commit Phase**:
-   - Leader commits locally
-   - Notifies all replicas to commit
-
-**Quorum Requirement**: `(serversPerCluster + 1) / 2` servers must respond
-
-### Two-Phase Commit (2PC)
-
-**Purpose**: Ensure atomicity for cross-shard transactions
-
-**Phases:**
-1. **Voting Phase** (implicit):
-   - Source and destination clusters process transaction
-   - Both must succeed for commit
-2. **Decision Phase**:
-   - Coordinator sends commit/abort to all participants
-   - Participants apply decision and release locks
-
-**Transaction States:**
-- `""` (empty): Committed intra-shard transaction
-- `"P"`: Pending cross-shard transaction
-- `"C"`: Committed cross-shard transaction
-
-## Transaction Types
-
-### 1. Intra-Shard Transaction
-- Source and destination clients are in the same cluster
-- Processed by single contact server
-- Committed immediately using Paxos
-- Status: `""` (empty string)
-
-### 2. Cross-Shard Transaction
-- Source and destination clients are in different clusters
-- Processed asynchronously by both clusters
-- Requires 2PC for final commit/abort
-- Status: `"P"` (pending) → `"C"` (committed) or aborted
-
-## Consensus Protocols
-
-### Paxos Protocol
-
-**Use Case**: Consensus within a cluster for intra-shard transactions
-
-**Properties:**
-- **Safety**: All servers agree on same transaction order
-- **Liveness**: System makes progress despite failures (with quorum)
-- **Fault Tolerance**: Works with up to `(N-1)/2` server failures
-
-**Implementation Details:**
-- Ballot numbers ensure leader uniqueness
-- Longest history ensures no transaction loss
-- Quorum ensures majority agreement
-
-### Two-Phase Commit (2PC)
-
-**Use Case**: Atomicity for cross-shard transactions
-
-**Properties:**
-- **Atomicity**: All-or-nothing execution
-- **Consistency**: All clusters reach same decision
-- **Blocking**: Can block if coordinator fails (simplified implementation)
-
-**Implementation Details:**
-- Coordinator waits for both clusters to complete
-- Commit decision based on both clusters' success
-- Rollback on abort restores original balances
-
-## Database Schema
-
-### `clients` Table
-
-| Column     | Type    | Description                    |
-|------------|---------|--------------------------------|
-| client_id  | INTEGER | Primary key, client identifier |
-| balance    | INTEGER | Current account balance        |
-| lock       | BOOLEAN | Lock status (0=unlocked, 1=locked) |
-
-### `transactions` Table
-
-| Column          | Type    | Description                          |
-|-----------------|---------|--------------------------------------|
-| transaction_id  | TEXT    | Primary key, UUID                    |
-| source          | INTEGER | Source client ID                     |
-| destination     | INTEGER | Destination client ID                |
-| amount          | INTEGER | Transaction amount                  |
-| ballot_number   | INTEGER | Paxos ballot number                  |
-| contact_server  | INTEGER | Contact server index                 |
-| status          | TEXT    | Transaction status ("", "P", "C")    |
-| created_at      | DATETIME| Transaction timestamp                |
-
-## Setup Instructions
-
-### Prerequisites
-
-- Go 1.23.2 or later
-- SQLite3 (usually included with Go SQLite driver)
-
-### Installation
-
-1. **Clone the repository**:
-   ```bash
-   git clone <repository-url>
-   cd 2pc-saicharanjakkula/distributed-banking
-   ```
-
-2. **Install dependencies**:
-   ```bash
-   go mod download
-   ```
-
-3. **Verify installation**:
-   ```bash
-   go build
-   ```
-
-### Running the System
-
-1. **Start the application**:
-   ```bash
-   go run main.go
-   ```
-
-2. **Configure the system**:
-   - Enter number of clusters (e.g., `2`)
-   - Enter number of servers per cluster (e.g., `3`)
-
-3. **Process transactions**:
-   - System reads transactions from `New_Test_Cases_-_Lab3.csv`
-   - Transactions are processed set by set
-   - After each set, interactive menu appears
-
-## Usage
-
-### Interactive Commands
-
-After processing each transaction set, you can:
-
-1. **Proceed to next set**: Continue to next transaction set
-2. **Print balance**: Query balance for a specific client ID
-   - Shows balance from all servers in the client's cluster
-   - Useful for verifying consistency across replicas
-3. **Print Datastore**: Display all committed transactions
-   - Shows transaction history from all servers
-   - Format: `|<ballot,contact>,status,(source,dest,amount)|`
-4. **Print Performance**: Display performance metrics
-   - Total transactions processed
-   - Total time elapsed
-   - Average latency per transaction
-   - Throughput (transactions per second)
-
-### Example Session
-
-```
-Enter the number of clusters: 2
-Enter the number of servers per cluster: 3
-
-Clusters initialized: map[C1:[S1 S2 S3] C2:[S4 S5 S6]]
-Processing Set 1
-Active Servers: [S1 S2 S3 S4 S5 S6]
-Contact Servers: [S1 S4]
-
-Transactions:
-    Transaction: 1 -> 2, Amount: 10
-    Transaction: 5 -> 6, Amount: 5
-
-Select an option:
 1 - Proceed to next set
 2 - Print balance
 3 - Print Datastore
 4 - Print Performance
+5 - Crash a server
+6 - Restore a server
+7 - Print cluster status
 ```
 
-### CSV Test Case Format
-
-The CSV file should have the following format:
-
-```csv
-SetNumber, Transaction, ActiveServers, ContactServers
-1, (1,2,10), [S1,S2,S3,S4], [S1,S4]
-, (3,4,5), [S1,S2,S3,S4], [S1,S4]
-2, (5,6,15), [S1,S2,S5,S6], [S1,S5]
-```
-
-- **SetNumber**: Transaction set identifier (first row of each set)
-- **Transaction**: `(source,destination,amount)`
-- **ActiveServers**: List of active servers for this set `[S1,S2,...]`
-- **ContactServers**: List of contact servers per cluster `[S1,S4,...]`
-
-## Performance Metrics
-
-The system tracks and reports:
-
-- **Total Transactions**: Number of successfully processed transactions
-- **Total Time**: Cumulative time for all transactions
-- **Average Latency**: `Total Time / Total Transactions`
-- **Throughput**: `Total Transactions / Total Time (seconds)`
-
-### Performance Considerations
-
-- **Intra-shard transactions**: Faster (single cluster consensus)
-- **Cross-shard transactions**: Slower (requires 2PC coordination)
-- **Quorum size**: Affects fault tolerance vs. performance trade-off
-- **Network latency**: RPC calls between servers add overhead
-- **Lock contention**: Concurrent transactions on same clients may conflict
-
-## Key Design Decisions
-
-1. **SQLite for Persistence**: Lightweight, embedded database suitable for simulation
-2. **RPC for Communication**: Simple, synchronous communication model
-3. **Mutex-based Locking**: Ensures thread safety on each server
-4. **Longest History Recovery**: Prevents transaction loss during failures
-5. **Sequential 2PC Processing**: Maintains transaction order for cross-shard transactions
-6. **Dynamic Port Assignment**: Ports assigned as `5000 + serverNumber` for scalability
-
-## Limitations and Future Improvements
-
-### Current Limitations
-
-1. **Blocking 2PC**: Coordinator failure can block the system
-2. **No Network Partition Handling**: Assumes reliable network
-3. **Sequential Cross-Shard Processing**: Could be optimized for parallelism
-4. **No Leader Election Protocol**: Uses highest ballot number implicitly
-5. **Simplified Failure Model**: Assumes servers either work or fail completely
-
-### Potential Improvements
-
-1. **Three-Phase Commit (3PC)**: Non-blocking commit protocol
-2. **Raft Consensus**: Alternative consensus algorithm with explicit leader election
-3. **Parallel 2PC**: Process multiple cross-shard transactions concurrently
-4. **Network Partition Tolerance**: Handle split-brain scenarios
-5. **Checkpointing**: Periodic state snapshots for faster recovery
-6. **Load Balancing**: Distribute transactions across multiple contact servers
-7. **Monitoring Dashboard**: Real-time visualization of system state
-
-## Testing
-
-The system includes test case files:
-- `guide.csv`: Example transactions
-- `lab1_Test.csv`: Lab 1 test cases
-- `New_Test_Cases_-_Lab3.csv`: Lab 3 test cases
-
-To use a different test file, modify the filename in `main.go`:
-```go
-sets, err := csv_parser.ParseCSV("your_test_file.csv")
-```
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Port Already in Use**:
-   - Ensure previous server instances are terminated
-   - Check for processes using ports 5000-5999
-
-2. **Database Lock Errors**:
-   - Close all database connections before restarting
-   - Delete `db_*.db` files if corrupted
-
-3. **Transaction Failures**:
-   - Check quorum size (need majority of active servers)
-   - Verify client balances are sufficient
-   - Ensure clients are not locked by other transactions
-
-4. **RPC Connection Errors**:
-   - Verify servers are running
-   - Check server addresses in `shared/serveraddress.go`
-   - Ensure network connectivity
-
-## License
-
-[Specify your license here]
-
-## Authors
-
-- Sai Charan Jakkula
-
-## Acknowledgments
-
-This project implements distributed systems concepts including:
-- Paxos consensus algorithm
-- Two-Phase Commit protocol
-- Distributed transaction processing
-- Replication and fault tolerance
+**Print Datastore** is the one to look at: it prints each replica's log as a chain of `<ballot,server>,(source,destination,amount)` entries, so you can see directly whether the replicas converged.
 
 ---
 
-For questions or issues, please refer to the code comments or create an issue in the repository.
+## Running the tests
+
+```bash
+cd distributed-banking && go test -race ./... -count=1
+```
+
+The suite spins up a real cluster in-process — real listeners, real RPCs — and asserts the guarantees that actually matter:
+
+| Test | What it pins down |
+|------|-------------------|
+| `TestCommitWithFullClusterReplicatesToAll` | A healthy cluster commits and all replicas match |
+| `TestCommitProceedsWithMinorityDown` | One replica down out of three still makes progress |
+| `TestRefusesToCommitWithoutQuorum` | Two down out of three → the survivor refuses rather than committing alone |
+| `TestFailedRoundReleasesLocks` | A failed round leaves no account stuck locked |
+| `TestNoMoneyCreatedOrDestroyed` | Balances sum to the same total after a run of transfers |
+| `TestReplicasConvergeOnIdenticalLogs` | Every replica holds the same entries in the same order, under the same ballots |
+| `TestRecoveredReplicaCatchesUp` | A restarted replica catches up instead of staying behind |
+| `TestReconciliationNeverDropsCommittedEntries` | Syncing from a peer never deletes committed state |
+| `TestBallotOrdering`, `TestSameRoundDifferentServersAreOrdered` | Ballots form a strict total order even when two servers reach the same round |
+| `TestQuorumSizeIsStrictMajority` | No two disjoint quorums are possible at any cluster size |
+| `TestAssignShardsToClustersCoversEveryAccount` | Every account maps to a cluster that exists, for any cluster count |
+| `TestMigrateAddsBallotServerToLegacySchema` | Databases from the old schema upgrade in place without losing rows |
+
+---
+
+## Failure demos
+
+Menu option **5** crashes a replica by closing its listener — peers get a connection refused exactly as they would from a dead machine, while its database survives on disk. Option **6** brings it back; it returns with the log it died with and catches up on the next prepare round. Option **7** prints which replicas are up and whether each cluster still holds a quorum.
+
+The sequence worth demonstrating:
+
+1. Run a set with all replicas up → commits, all logs match.
+2. Crash one replica in a cluster (2 of 3 alive) → still commits, quorum holds.
+3. Crash a second (1 of 3 alive) → the leader **refuses**; balances unchanged.
+4. Restore both, run another transfer → the recovered replicas catch up.
+
+---
+
+## Screenshots
+
+Captures live in [`docs/screenshots/`](docs/screenshots/). See that directory's README for the exact capture checklist.
+
+| | |
+|---|---|
+| **Cluster startup** — 3×3 topology initialising | ![Cluster startup](docs/screenshots/01-cluster-startup.png) |
+| **Intra-shard commit** — one Paxos round | ![Intra-shard commit](docs/screenshots/02-intra-shard-commit.png) |
+| **Cross-shard commit** — two rounds under 2PC | ![Cross-shard commit](docs/screenshots/03-cross-shard-commit.png) |
+| **Cross-shard abort** — insufficient funds | ![Cross-shard abort](docs/screenshots/04-cross-shard-abort.png) |
+| **Minority down** — consensus still reached | ![Minority down](docs/screenshots/05-minority-down-commits.png) |
+| **Majority down** — leader refuses | ![Majority down](docs/screenshots/06-majority-down-refuses.png) |
+| **Recovery** — restarted replica catches up | ![Recovery](docs/screenshots/07-recovery-catch-up.png) |
+| **Datastore** — identical logs across replicas | ![Datastore](docs/screenshots/08-datastore-converged.png) |
+| **Performance** — throughput and latency | ![Performance](docs/screenshots/09-performance.png) |
+| **Test suite** — green under `-race` | ![Tests](docs/screenshots/10-tests-green.png) |
+
+---
+
+## What changed and why
+
+The original passed the course's test cases but violated Paxos safety in several places. Each fix below has a test that fails without it.
+
+### Ballots had no total order
+
+Ballots were a bare `int`. Two servers in a cluster can independently reach the same counter value, and an acceptor comparing only counters cannot tell those proposals apart — so it followed both.
+
+Ballots are now `Ballot{Number, ServerID}`, ordered by number then proposing server. Two leaders at round 1 produce `<1,1>` and `<1,2>`, which are strictly ordered, so acceptors can always tell which proposal is newer.
+
+### Acceptors never rejected anything
+
+`Prepare` did `s.BallotNumber = request.LeaderBallotNumber` unconditionally — it adopted whatever ballot arrived, letting a stale leader reclaim a cluster that had already promised to a newer one.
+
+Acceptors now promise only to a strictly greater ballot, reject accepts below their promise, and return what they have already accepted so the leader can adopt an in-flight value rather than overwrite it.
+
+### The leader never counted votes
+
+`PreparePhase` and `AcceptPhase` looped over peers, fired an RPC, and **discarded both the reply and the error**. Nothing was ever tallied, so the leader committed regardless of what the cluster said. This is the bug that meant the code did not actually implement Paxos.
+
+Both phases now broadcast concurrently, collect replies, and return a count. The leader commits only on a strict majority at *both* phases, and releases its locks when a round fails. Every RPC has a timeout, so a dead peer fails fast instead of hanging the round.
+
+### The quorum check consulted the test fixture
+
+The old gate was `len(request.ActiveServers) < GetQuorumSize()` — how many servers the **CSV file claimed** were up, not how many replied. A partitioned leader whose CSV still listed nine servers would commit alone.
+
+That check is gone. The gate is now the promise and accept counts returned by the phases themselves.
+
+### Quorum size was not a majority
+
+`GetQuorumSize` returned `(n+1)/2`, which is a majority only for odd `n`. With four servers it returned 2, so two disjoint halves could each believe they held a quorum. Now `n/2 + 1`.
+
+### Reconciliation destroyed committed state
+
+`FetchLongestTransactionHistory` picked whichever replica reported the most rows, then `DELETE`d every local row and rewrote the table from that peer. Length is not authority, and destroying durable history to synchronise means one bad peer can erase a replica's log.
+
+Reconciliation is now additive: entries already present are left alone, missing entries are inserted, and nothing is ever deleted.
+
+### A data race decided what got sent
+
+Both cross-shard goroutines wrote `ContactServer` on the same shared transaction struct before passing it by value into their RPC, so whichever wrote last silently decided what the other side sent. Each side now gets its own copy. The suite runs clean under `-race`.
+
+### Accounts could be locked forever
+
+A round that took locks and then failed left both accounts locked with no path to release, so every later transfer touching them aborted. Failed rounds now release what they took.
+
+### Shard assignment could map past the end
+
+`AssignShardsToClusters` used a flat `dataCount/clusterCount` stride, so any count that did not divide evenly pushed trailing accounts into a cluster index past the end — 3000 accounts over 7 clusters put the last 6 in `C8`, which does not exist. The remainder is now spread over the leading clusters.
+
+### Housekeeping
+
+- Swapped `mattn/go-sqlite3` (cgo) for `modernc.org/sqlite` (pure Go), so the project builds with no C toolchain.
+- `GetAllTransactions` returned `[]map[string]interface{}` and callers did unchecked `.(int)` assertions that would panic on any surprise. It returns `[]shared.Transaction` now, deleting those sites entirely.
+- Connections were `defer client.Close()`d **inside loops**, leaking until the whole phase returned. They close per iteration.
+- Removed ~145 lines of commented-out debug printing and three unused files.
+- Replaced the CI workflow — which POSTed the repo and commit SHA to a course grading endpoint — with build, vet, gofmt, and `go test -race`.
+
+---
+
+## Limitations
+
+Stated plainly, because they are real:
+
+- **The replicas are goroutines in one process.** They communicate over genuine TCP RPC with real listeners, and crashing one produces a real connection refused — but they are not separate OS processes. Running them as separate processes would need a config file and a `cmd/server` split.
+- **The 2PC coordinator is not crash-recoverable.** It holds its decision in memory with no write-ahead log. If it dies between the votes and the decision broadcast, participants are left holding locks with no one to resolve them. A durable decision log plus a recovery pass on restart is the fix.
+- **No leader election.** The contact server for each cluster comes from the CSV rather than being elected. Paxos will correctly reject a stale leader, but nothing promotes a new one automatically.
+- **Locks are held across network calls.** `HandleTransaction` holds the server mutex for its whole body, including synchronous RPCs to peers that take their own locks. The 10 ms gap between transactions is currently what keeps this from deadlocking.
+- **The log has no explicit index.** Entries are ordered by insertion time rather than by a monotonic position, which is enough here but would not survive concurrent leaders writing at the same index.
+
+---
+
+## Project layout
+
+```
+distributed-banking/
+├── main.go              Workload driver, 2PC coordinator, operator menu
+├── main_test.go         Shard assignment tests
+├── client/              RPC client helpers
+├── csv_parser/          Test-case CSV reader
+├── database/            SQLite schema, migrations, queries
+├── paxos/               Prepare / Accept / Commit phases, quorum counting
+├── server/              Replica: acceptor logic, leader logic, lifecycle
+│   └── cluster_test.go  In-process cluster integration tests
+└── shared/              Ballot, Transaction, addressing, quorum math
+```

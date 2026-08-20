@@ -43,10 +43,10 @@ func main() {
 
 	// Assign data shards to clusters
 	shardMapping := AssignShardsToClusters(3000, clusterCount)
-	// fmt.Println("Shard mapping:", shardMapping)
 
-	// Start servers using StartServerRPC
-	// servers := []*server.Server{}
+	// Start servers using StartServerRPC. Keep the handles: they are what let
+	// the operator crash and restore a replica from the menu.
+	servers := make(map[string]*server.Server)
 	for clusterID, serverIDs := range clusterServers {
 		for _, serverID := range serverIDs {
 			shardsForCluster := GetShardsForCluster(shardMapping, clusterID)
@@ -60,7 +60,7 @@ func main() {
 				fmt.Printf("Error starting server %s\n", serverID)
 				continue
 			}
-			// servers = append(servers, srv)
+			servers[serverID] = srv
 		}
 	}
 
@@ -88,24 +88,18 @@ func main() {
 			clusterIDForSource := shardMapping[tx.Source]
 
 			// Fetch the contact server using the cluster ID and set.ContactServerList
-			// fmt.Printf("Debug: clusterIDForSource is %s\n", clusterIDForSource)
 			contactServerForSource, err := shared.GetContactServerForCluster(clusterIDForSource, set.ContactServerList)
 			if err != nil {
 				fmt.Printf("Error fetching contact server for cluster %s: %v\n", clusterIDForSource, err)
 				continue
 			}
-			// fmt.Printf("Debug: contactServerForSource is %s\n", contactServerForSource)
 			clusterIDForDestination := shardMapping[tx.Destination]
-			// fmt.Printf("Debug: clusterIDForDestination is %s\n", clusterIDForDestination)
 			// Fetch the contact server using the cluster ID and set.ContactServerList
 			contactServerForDestination, err := shared.GetContactServerForCluster(clusterIDForDestination, set.ContactServerList)
 			if err != nil {
-				// fmt.Printf("Error fetching contact server for cluster %s: %v\n", clusterIDForDestination, err)
 				continue
 			}
-			// fmt.Printf("Debug: contactServerForDestination is %s\n", contactServerForDestination)
 			// Print the contact server
-			// fmt.Printf("Contact server for cluster %s: %s\n", clusterID, contactServer)
 			// Filter active servers for the source and destination shards
 			activeServersForSourceShard := filterActiveServers(set.ActiveServerList, clusterIDForSource)
 			activeServersForDestinationShard := filterActiveServers(set.ActiveServerList, clusterIDForDestination)
@@ -116,7 +110,7 @@ func main() {
 				Source:        tx.Source,
 				Destination:   tx.Destination,
 				Amount:        tx.Amount,
-				BallotNumber:  1,
+				Ballot:        shared.Ballot{Number: 1},
 				ContactServer: 1,
 				Status:        "",
 			}
@@ -124,10 +118,8 @@ func main() {
 			startTime := time.Now()
 			if contactServerForSource == contactServerForDestination {
 				// Intra-shard transaction
-				// fmt.Printf("Sending intra-shard transaction to %s\n", contactServerForSource)
 				serverIndex, err := extractServerIndex(contactServerForSource)
 				if err != nil {
-					// fmt.Printf("Error extracting server index: %v\n", err)
 				}
 				convertedTx.ContactServer = serverIndex
 				success, latency := client.SendIntraShardTransaction(contactServerForSource, convertedTx, activeServersForSourceShard)
@@ -137,7 +129,6 @@ func main() {
 				}
 			} else {
 				// Cross-shard transaction
-				// fmt.Printf("Sending cross-shard transaction between %s and %s asynchronously\n", contactServerForSource, contactServerForDestination)
 				convertedTx.Status = "P"
 
 				sourceDone := make(chan struct {
@@ -149,13 +140,21 @@ func main() {
 					latency time.Duration
 				})
 
+				// Each side gets its own copy. Both goroutines used to write
+				// ContactServer on the same shared struct and then pass it by
+				// value into their RPC, so whichever wrote last decided what
+				// the other side sent.
+				sourceTx := convertedTx
+				if serverIndex, err := extractServerIndex(contactServerForSource); err == nil {
+					sourceTx.ContactServer = serverIndex
+				}
+				destTx := convertedTx
+				if serverIndex, err := extractServerIndex(contactServerForDestination); err == nil {
+					destTx.ContactServer = serverIndex
+				}
+
 				go func() {
-					serverIndex, err := extractServerIndex(contactServerForSource)
-					if err != nil {
-						// fmt.Printf("Error extracting server index: %v\n", err)
-					}
-					convertedTx.ContactServer = serverIndex
-					success, latency := client.SendCrossShardTransaction(contactServerForSource, convertedTx, activeServersForSourceShard, "source")
+					success, latency := client.SendCrossShardTransaction(contactServerForSource, sourceTx, activeServersForSourceShard, "source")
 					sourceDone <- struct {
 						success bool
 						latency time.Duration
@@ -163,12 +162,7 @@ func main() {
 				}()
 
 				go func() {
-					serverIndex, err := extractServerIndex(contactServerForDestination)
-					if err != nil {
-						// fmt.Printf("Error extracting server index: %v\n", err)
-					}
-					convertedTx.ContactServer = serverIndex
-					success, latency := client.SendCrossShardTransaction(contactServerForDestination, convertedTx, activeServersForDestinationShard, "destination")
+					success, latency := client.SendCrossShardTransaction(contactServerForDestination, destTx, activeServersForDestinationShard, "destination")
 					destDone <- struct {
 						success bool
 						latency time.Duration
@@ -188,12 +182,11 @@ func main() {
 				// Store this cross-shard transaction for later 2PC
 				pendingCommits = append(pendingCommits, PendingCommit{
 					sequence:      sequenceCounter,
-					transaction:   convertedTx,
+					transaction:   sourceTx,
 					sourceServers: activeServersForSourceShard,
 					destServers:   activeServersForDestinationShard,
 					shouldCommit:  sourceResult.success && destResult.success,
 				})
-				// fmt.Printf("Debug: pendingCommits is %v\n", pendingCommits)
 				sequenceCounter++
 			}
 			time.Sleep(10 * time.Millisecond)
@@ -203,7 +196,6 @@ func main() {
 		sort.Slice(pendingCommits, func(i, j int) bool {
 			return pendingCommits[i].sequence < pendingCommits[j].sequence
 		})
-		// fmt.Printf("Debug: pendingCommits after sorting is %v\n", pendingCommits)
 
 		// Process 2PC commits in order
 		// Process 2PC commits in order
@@ -234,28 +226,129 @@ func main() {
 			fmt.Println("2 - Print balance")
 			fmt.Println("3 - Print Datastore")
 			fmt.Println("4 - Print Performance")
+			fmt.Println("5 - Crash a server")
+			fmt.Println("6 - Restore a server")
+			fmt.Println("7 - Print cluster status")
 
 			input, _ := reader.ReadString('\n')
 			input = strings.TrimSpace(input)
 			choice, err := strconv.Atoi(input)
 			if err != nil {
-				fmt.Println("Invalid input. Please enter a number from 1 to 4.")
+				fmt.Println("Invalid input. Please enter a number from 1 to 7.")
 				continue
 			}
 
-			if choice == 1 {
-				break
-			} else if choice == 2 {
+			switch choice {
+			case 1:
+				// break out of the menu loop, on to the next set
+			case 2:
 				PrintBalance(shardMapping, clusterServers)
-			} else if choice == 3 {
+				continue
+			case 3:
 				PrintDatastore(clusterServers)
-			} else if choice == 4 {
+				continue
+			case 4:
 				PrintPerformance(totalTransactions, totalTime)
-			} else {
-				fmt.Println("Invalid choice. Please enter 1 to 4.")
+				continue
+			case 5:
+				CrashServer(reader, servers)
+				continue
+			case 6:
+				RestoreServer(reader, servers)
+				continue
+			case 7:
+				PrintClusterStatus(clusterServers, servers)
+				continue
+			default:
+				fmt.Println("Invalid choice. Please enter 1 to 7.")
+				continue
 			}
+			break
 		}
 	}
+}
+
+// CrashServer takes a replica offline. Its listener closes, so peers see a
+// connection refused exactly as they would from a dead machine, while its
+// database survives on disk for the eventual restore.
+func CrashServer(reader *bufio.Reader, servers map[string]*server.Server) {
+	srv := promptForServer(reader, servers)
+	if srv == nil {
+		return
+	}
+	if !srv.IsRunning() {
+		fmt.Printf("Server %s is already down.\n", srv.ID)
+		return
+	}
+	if err := srv.Crash(); err != nil {
+		fmt.Printf("Failed to crash server %s: %v\n", srv.ID, err)
+		return
+	}
+	fmt.Printf("Server %s is down. Its cluster needs %d of %d replicas to keep committing.\n",
+		srv.ID, shared.GetQuorumSize(), shared.GetServersPerCluster())
+}
+
+// RestoreServer brings a crashed replica back. It returns with whatever log it
+// had when it died and catches up on the next prepare round.
+func RestoreServer(reader *bufio.Reader, servers map[string]*server.Server) {
+	srv := promptForServer(reader, servers)
+	if srv == nil {
+		return
+	}
+	if srv.IsRunning() {
+		fmt.Printf("Server %s is already up.\n", srv.ID)
+		return
+	}
+	if err := srv.Restore(); err != nil {
+		fmt.Printf("Failed to restore server %s: %v\n", srv.ID, err)
+		return
+	}
+	fmt.Printf("Server %s is back up and will catch up on the next round.\n", srv.ID)
+}
+
+// PrintClusterStatus shows which replicas are up, and whether each cluster
+// still holds a quorum.
+func PrintClusterStatus(clusterServers map[string][]string, servers map[string]*server.Server) {
+	quorum := shared.GetQuorumSize()
+
+	clusterIDs := make([]string, 0, len(clusterServers))
+	for clusterID := range clusterServers {
+		clusterIDs = append(clusterIDs, clusterID)
+	}
+	sort.Strings(clusterIDs)
+
+	for _, clusterID := range clusterIDs {
+		alive := 0
+		states := []string{}
+		for _, serverID := range clusterServers[clusterID] {
+			srv, ok := servers[serverID]
+			if ok && srv.IsRunning() {
+				alive++
+				states = append(states, fmt.Sprintf("%s UP", serverID))
+			} else {
+				states = append(states, fmt.Sprintf("%s DOWN", serverID))
+			}
+		}
+		verdict := "quorum"
+		if alive < quorum {
+			verdict = "NO QUORUM"
+		}
+		fmt.Printf("%s: %s  [%d/%d alive, needs %d: %s]\n",
+			clusterID, strings.Join(states, ", "), alive, len(clusterServers[clusterID]), quorum, verdict)
+	}
+}
+
+func promptForServer(reader *bufio.Reader, servers map[string]*server.Server) *server.Server {
+	fmt.Print("Enter server ID (e.g. S1): ")
+	input, _ := reader.ReadString('\n')
+	serverID := strings.ToUpper(strings.TrimSpace(input))
+
+	srv, ok := servers[serverID]
+	if !ok {
+		fmt.Printf("Unknown server %q\n", serverID)
+		return nil
+	}
+	return srv
 }
 
 func ConfigureClusters() (int, int) {
@@ -304,13 +397,34 @@ func InitializeClusters(clusterCount int, serversPerCluster int) map[string][]st
 	return clusterServers
 }
 
+// AssignShardsToClusters splits dataCount accounts into contiguous ranges, one
+// per cluster.
+//
+// The previous version used a flat dataCount/clusterCount stride, so any count
+// that did not divide evenly pushed the trailing accounts into a cluster index
+// past the end: with 3000 accounts and 7 clusters the last 6 accounts mapped to
+// "C8", which does not exist. The remainder is now spread over the first few
+// clusters instead.
 func AssignShardsToClusters(dataCount int, clusterCount int) map[int]string {
 	shardMapping := make(map[int]string)
-	itemsPerCluster := dataCount / clusterCount
+	if clusterCount <= 0 || dataCount <= 0 {
+		return shardMapping
+	}
 
-	for i := 1; i <= dataCount; i++ {
-		clusterID := fmt.Sprintf("C%d", (i-1)/itemsPerCluster+1)
-		shardMapping[i] = clusterID
+	base := dataCount / clusterCount
+	remainder := dataCount % clusterCount
+
+	account := 1
+	for cluster := 1; cluster <= clusterCount; cluster++ {
+		size := base
+		if cluster <= remainder {
+			size++
+		}
+		clusterID := fmt.Sprintf("C%d", cluster)
+		for i := 0; i < size; i++ {
+			shardMapping[account] = clusterID
+			account++
+		}
 	}
 
 	return shardMapping
@@ -361,8 +475,6 @@ func PrintBalance(shardMapping map[int]string, clusterServers map[string][]strin
 
 func PrintDatastore(clusterServers map[string][]string) {
 	for _, servers := range clusterServers {
-		// fmt.Printf("Cluster %s:\n", clusterID)
-		// fmt.Print("\n")
 		for _, serverID := range servers {
 			serverAddress, err := shared.ServerAddresses(serverID)
 			if err != nil {
@@ -384,9 +496,9 @@ func PrintDatastore(clusterServers map[string][]string) {
 			fmt.Printf("%s :", serverID)
 			for _, tx := range transactions {
 				if tx.Status == "" {
-					fmt.Printf(" -> |<%d,%d>,(%d,%d,%d)|", tx.BallotNumber, tx.ContactServer, tx.Source, tx.Destination, tx.Amount)
+					fmt.Printf(" -> |%s,(%d,%d,%d)|", tx.Ballot, tx.Source, tx.Destination, tx.Amount)
 				} else {
-					fmt.Printf(" -> |<%d,%d>, %s,(%d,%d,%d)|", tx.BallotNumber, tx.ContactServer, tx.Status, tx.Source, tx.Destination, tx.Amount)
+					fmt.Printf(" -> |%s, %s,(%d,%d,%d)|", tx.Ballot, tx.Status, tx.Source, tx.Destination, tx.Amount)
 				}
 			}
 			fmt.Print("\n")

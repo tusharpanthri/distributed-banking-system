@@ -4,7 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 type Database struct {
@@ -15,7 +15,7 @@ type Database struct {
 
 func InitDatabase(serverID string, shardIDs []int) (*Database, error) {
 	filePath := fmt.Sprintf("db_%s.db", serverID)
-	db, err := sql.Open("sqlite3", filePath)
+	db, err := sql.Open("sqlite", filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database for server %s: %v", serverID, err)
 	}
@@ -33,6 +33,7 @@ func InitDatabase(serverID string, shardIDs []int) (*Database, error) {
 		destination INTEGER NOT NULL,
 		amount INTEGER NOT NULL,
 		ballot_number INTEGER NOT NULL,
+		ballot_server INTEGER NOT NULL DEFAULT 0,
 		contact_server INTEGER NOT NULL,
 		status TEXT NOT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -40,6 +41,10 @@ func InitDatabase(serverID string, shardIDs []int) (*Database, error) {
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create tables for server %s: %v", serverID, err)
+	}
+
+	if err := migrate(db); err != nil {
+		return nil, fmt.Errorf("failed to migrate schema for server %s: %v", serverID, err)
 	}
 
 	// Initialize the clients table with an initial balance of 10 and lock set to false
@@ -61,4 +66,46 @@ func ClearTransactions(db *sql.DB) error {
 		return fmt.Errorf("failed to clear transactions table: %v", err)
 	}
 	return nil
+}
+
+// migrate brings a database created by an earlier version of the schema up to
+// date. Ballots used to be a bare integer, so transactions tables written
+// before the Ballot struct landed have no ballot_server column.
+func migrate(db *sql.DB) error {
+	has, err := hasColumn(db, "transactions", "ballot_server")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := db.Exec(`ALTER TABLE transactions ADD COLUMN ballot_server INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("failed to add ballot_server column: %v", err)
+		}
+	}
+	return nil
+}
+
+func hasColumn(db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, fmt.Errorf("failed to inspect table %s: %v", table, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			ctype      string
+			notNull    int
+			defaultVal sql.NullString
+			pk         int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &defaultVal, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, rows.Err()
+		}
+	}
+	return false, rows.Err()
 }

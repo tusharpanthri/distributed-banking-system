@@ -1,147 +1,212 @@
 package paxos
 
 import (
-	"distributed-banking/shared"
 	"fmt"
+	"net"
 	"net/rpc"
+	"sync"
+	"time"
+
+	"distributed-banking/shared"
 )
 
-func FetchLongestTransactionHistory(leaderID string, activeServers []string) ([]shared.Transaction, int) {
-	var longestHistory []shared.Transaction
-	var highestBallotNumber int
-	maxLength := 0
+const (
+	// A dead peer must fail fast rather than hanging the leader. net/rpc has no
+	// built-in deadline, so every call is raced against a timer.
+	dialTimeout = 500 * time.Millisecond
+	callTimeout = 1 * time.Second
+)
 
-	for _, serverID := range activeServers {
-		if serverID == leaderID {
-			continue
-		}
-
-		serverAddr, ok := shared.ServerAddresses(serverID)
-		if ok != nil {
-			// fmt.Printf("Server address not found for server %s\n", serverID)
-			continue
-		}
-
-		client, err := rpc.Dial("tcp", serverAddr)
-		if err != nil {
-			// fmt.Printf("Failed to connect to server %s: %v\n", serverAddr, err)
-			continue
-		}
-		defer client.Close()
-
-		var serverTransactions []shared.Transaction
-		err = client.Call(fmt.Sprintf("Server.%s.CommittedTransactionsInDB", serverID), struct{}{}, &serverTransactions)
-		if err != nil {
-			// fmt.Printf("Failed to fetch committed transactions from server %s: %v\n", serverID, err)
-			continue
-		}
-		if len(serverTransactions) > maxLength {
-			longestHistory = serverTransactions
-			maxLength = len(serverTransactions)
-		}
-		var ballotNumber int
-		err = client.Call(fmt.Sprintf("Server.%s.FetchBallotNumber", serverID), struct{}{}, &ballotNumber)
-		if err != nil {
-			// fmt.Printf("Failed to fetch committed transactions from server %s: %v\n", serverID, err)
-			continue
-		}
-		if ballotNumber > highestBallotNumber {
-			highestBallotNumber = ballotNumber
-		}
+// dial opens a connection to a peer with a bounded handshake.
+func dial(serverID string) (*rpc.Client, error) {
+	addr, err := shared.ServerAddresses(serverID)
+	if err != nil {
+		return nil, err
 	}
-
-	return longestHistory, highestBallotNumber
+	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return rpc.NewClient(conn), nil
 }
 
-func PreparePhase(leaderID string, activeServers []string, longestHistory []shared.Transaction, leaderBallotNumber int) {
-	for _, serverID := range activeServers {
-		if serverID == leaderID {
-			continue
-		}
+// callWithTimeout issues an RPC and gives up after callTimeout. Without this a
+// single unresponsive peer blocks the entire phase.
+func callWithTimeout(client *rpc.Client, method string, args, reply interface{}) error {
+	done := make(chan *rpc.Call, 1)
+	client.Go(method, args, reply, done)
 
-		serverAddr, ok := shared.ServerAddresses(serverID)
-		if ok != nil {
-			// fmt.Printf("Server address not found for server %s\n", serverID)
-			continue
-		}
-
-		client, err := rpc.Dial("tcp", serverAddr)
-		if err != nil {
-			// fmt.Printf("Failed to connect to server %s: %v\n", serverAddr, err)
-			continue
-		}
-		defer client.Close()
-
-		// Send prepare request with the longest history
-		var acknowledgment string
-		prepareRequest := shared.PrepareRequest{
-			CommittedTransactions: longestHistory,
-			LeaderBallotNumber:    leaderBallotNumber,
-		}
-
-		err = client.Call(fmt.Sprintf("Server.%s.Prepare", serverID), prepareRequest, &acknowledgment)
-		if err != nil {
-			// fmt.Printf("Failed to prepare phase on server %s: %v\n", serverID, err)
-		} else {
-			// fmt.Printf("Prepare phase acknowledgment received from server %s: %s\n", serverID, acknowledgment)
-		}
+	select {
+	case call := <-done:
+		return call.Error
+	case <-time.After(callTimeout):
+		// The reply is abandoned: the in-flight call may still write to it, so
+		// callers must not read it once this returns an error.
+		return fmt.Errorf("rpc %s timed out after %s", method, callTimeout)
 	}
 }
 
-func AcceptPhase(leaderID string, activeServers []string, singleTransaction shared.Transaction) {
-	for _, serverID := range activeServers {
-		if serverID == leaderID {
+// PrepareResult is what the leader learned from a prepare round.
+type PrepareResult struct {
+	Promises int           // Servers that promised, including the leader itself
+	Quorum   bool          // Whether Promises reached a strict majority
+	MaxSeen  shared.Ballot // Highest ballot any acceptor reported, for catch-up
+	// AdoptedLog is the log held by the acceptor with the highest accepted
+	// ballot. Paxos requires the leader to re-propose an in-flight value rather
+	// than replace it, so this may not be the leader's own log.
+	AdoptedLog      []shared.Transaction
+	AdoptedFrom     shared.Ballot
+	adoptedFromPeer bool
+}
+
+// PreparePhase sends prepares to every peer concurrently and reports how many
+// promised. The leader counts as one promise: it is an acceptor too, and it has
+// trivially promised to its own ballot.
+func PreparePhase(leaderID string, activeServers []string, leaderLog []shared.Transaction, ballot shared.Ballot) PrepareResult {
+	replies := broadcast(leaderID, activeServers, func(serverID string, client *rpc.Client) (shared.PromiseReply, bool) {
+		var promise shared.PromiseReply
+		req := shared.PrepareRequest{CommittedTransactions: leaderLog, LeaderBallot: ballot}
+		if err := callWithTimeout(client, fmt.Sprintf("Server.%s.Prepare", serverID), req, &promise); err != nil {
+			return shared.PromiseReply{}, false
+		}
+		return promise, true
+	})
+
+	result := PrepareResult{
+		Promises:    1, // the leader promises to itself
+		MaxSeen:     ballot,
+		AdoptedLog:  leaderLog,
+		AdoptedFrom: shared.Ballot{},
+	}
+
+	for _, promise := range replies {
+		if promise.PromisedBallot.GreaterThan(result.MaxSeen) {
+			result.MaxSeen = promise.PromisedBallot
+		}
+		if !promise.Promised {
+			// A rejection still tells us someone is further ahead.
 			continue
 		}
-
-		serverAddr, ok := shared.ServerAddresses(serverID)
-		if ok != nil {
-			// fmt.Printf("Server address not found for server %s\n", serverID)
-			continue
+		result.Promises++
+		// Adopt the value accepted under the highest ballot seen in the quorum.
+		if !promise.AcceptedBallot.IsZero() && promise.AcceptedBallot.GreaterThan(result.AdoptedFrom) {
+			result.AdoptedFrom = promise.AcceptedBallot
+			result.AdoptedLog = promise.AcceptedLog
+			result.adoptedFromPeer = true
 		}
+	}
 
-		client, err := rpc.Dial("tcp", serverAddr)
-		if err != nil {
-			// fmt.Printf("Failed to connect to server %s: %v\n", serverAddr, err)
-			continue
+	result.Quorum = result.Promises >= shared.GetQuorumSize()
+	return result
+}
+
+// AcceptResult is what the leader learned from an accept round.
+type AcceptResult struct {
+	Accepts int
+	Quorum  bool
+	MaxSeen shared.Ballot
+}
+
+// AcceptPhase sends accepts concurrently and counts the acks. The leader only
+// commits if this reports a quorum.
+func AcceptPhase(leaderID string, activeServers []string, tx shared.Transaction) AcceptResult {
+	replies := broadcast(leaderID, activeServers, func(serverID string, client *rpc.Client) (shared.AcceptReply, bool) {
+		var reply shared.AcceptReply
+		if err := callWithTimeout(client, fmt.Sprintf("Server.%s.AcceptTransactions", serverID), tx, &reply); err != nil {
+			return shared.AcceptReply{}, false
 		}
-		defer client.Close()
+		return reply, true
+	})
 
+	result := AcceptResult{Accepts: 1, MaxSeen: tx.Ballot} // the leader accepts its own proposal
+	for _, reply := range replies {
+		if reply.PromisedBallot.GreaterThan(result.MaxSeen) {
+			result.MaxSeen = reply.PromisedBallot
+		}
+		if reply.Accepted {
+			result.Accepts++
+		}
+	}
+	result.Quorum = result.Accepts >= shared.GetQuorumSize()
+	return result
+}
+
+// CommitPhase is best-effort: the decision is already made by the time it runs,
+// so a peer that misses it catches up on the next prepare.
+func CommitPhase(leaderID string, activeServers []string, tx shared.Transaction) {
+	broadcast(leaderID, activeServers, func(serverID string, client *rpc.Client) (struct{}, bool) {
 		var reply string
-		err = client.Call(fmt.Sprintf("Server.%s.AcceptTransactions", serverID), singleTransaction, &reply)
-		if err != nil {
-			// fmt.Printf("Failed to x transaction to server %s: %v\n", serverID, err)
-		} else {
-			// fmt.Printf("Accept Phase successful on server %s: %s\n", serverID, reply)
-		}
-	}
+		err := callWithTimeout(client, fmt.Sprintf("Server.%s.CommitTransactions", serverID), tx, &reply)
+		return struct{}{}, err == nil
+	})
 }
 
-func CommitPhase(leaderID string, activeServers []string, transaction shared.Transaction) {
+// broadcast runs fn against every peer except the leader, in parallel, and
+// returns only the replies that came back. Sequential rounds meant one slow
+// peer added its latency to every peer after it.
+func broadcast[T any](leaderID string, activeServers []string, fn func(string, *rpc.Client) (T, bool)) []T {
+	var (
+		mu      sync.Mutex
+		results []T
+		wg      sync.WaitGroup
+	)
+
 	for _, serverID := range activeServers {
 		if serverID == leaderID {
 			continue
 		}
+		wg.Add(1)
+		go func(serverID string) {
+			defer wg.Done()
 
-		serverAddr, ok := shared.ServerAddresses(serverID)
-		if ok != nil {
-			// fmt.Printf("Server address not found for server %s\n", serverID)
-			continue
+			client, err := dial(serverID)
+			if err != nil {
+				return
+			}
+			defer client.Close()
+
+			value, ok := fn(serverID, client)
+			if !ok {
+				return
+			}
+			mu.Lock()
+			results = append(results, value)
+			mu.Unlock()
+		}(serverID)
+	}
+
+	wg.Wait()
+	return results
+}
+
+// FetchLongestTransactionHistory is retained for callers that only need a peer
+// snapshot outside a Paxos round.
+func FetchLongestTransactionHistory(leaderID string, activeServers []string) ([]shared.Transaction, shared.Ballot) {
+	type snapshot struct {
+		log    []shared.Transaction
+		ballot shared.Ballot
+	}
+
+	snapshots := broadcast(leaderID, activeServers, func(serverID string, client *rpc.Client) (snapshot, bool) {
+		var s snapshot
+		if err := callWithTimeout(client, fmt.Sprintf("Server.%s.CommittedTransactionsInDB", serverID), struct{}{}, &s.log); err != nil {
+			return snapshot{}, false
 		}
-
-		client, err := rpc.Dial("tcp", serverAddr)
-		if err != nil {
-			// fmt.Printf("Failed to connect to server %s: %v\n", serverAddr, err)
-			continue
+		if err := callWithTimeout(client, fmt.Sprintf("Server.%s.FetchBallotNumber", serverID), struct{}{}, &s.ballot); err != nil {
+			return snapshot{}, false
 		}
-		defer client.Close()
+		return s, true
+	})
 
-		var reply string
-		err = client.Call(fmt.Sprintf("Server.%s.CommitTransactions", serverID), transaction, &reply)
-		if err != nil {
-			// fmt.Printf("Failed to commit transaction on server %s: %v\n", serverID, err)
-		} else {
-			// fmt.Printf("Commit Phase successful on server %s: %s\n", serverID, reply)
+	var longest []shared.Transaction
+	var highest shared.Ballot
+	for _, s := range snapshots {
+		if len(s.log) > len(longest) {
+			longest = s.log
+		}
+		if s.ballot.GreaterThan(highest) {
+			highest = s.ballot
 		}
 	}
+	return longest, highest
 }

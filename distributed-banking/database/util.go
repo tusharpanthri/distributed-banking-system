@@ -30,12 +30,11 @@ func UpdateClientBalance(db *sql.DB, clientID int, amount int) error {
 }
 
 // Inserts a new transaction into the transactions table with a timestamp
-func AddTransaction(db *sql.DB, txID string, source int, destination int, amount int, ballot_number int, contact_server int, status string) error {
-	// fmt.Printf("Adding transaction: ID=%s, Source=%d, Destination=%d, Amount=%d, Status=%s\n", txID, source, destination, amount, status)
+func AddTransaction(db *sql.DB, txID string, source int, destination int, amount int, ballot shared.Ballot, contact_server int, status string) error {
 	_, err := db.Exec(`
-		INSERT INTO transactions (transaction_id, source, destination, amount, ballot_number, contact_server, status, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-		txID, source, destination, amount, ballot_number, contact_server, status,
+		INSERT INTO transactions (transaction_id, source, destination, amount, ballot_number, ballot_server, contact_server, status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+		txID, source, destination, amount, ballot.Number, ballot.ServerID, contact_server, status,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to add transaction %s: %v", txID, err)
@@ -44,93 +43,24 @@ func AddTransaction(db *sql.DB, txID string, source int, destination int, amount
 }
 
 // // Updates the status of a specific transaction
-// func UpdateTransactionStatus(db *sql.DB, txID string, status string) error {
-// 	_, err := db.Exec(`UPDATE transactions SET status = ? WHERE transaction_id = ?`, status, txID)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to update transaction status for %s: %v", txID, err)
-// 	}
-// 	return nil
-// }
 
 // // Retrieves all transactions with a specific status, ordered by creation time
-// func GetTransactionsByStatus(db *sql.DB, status string) ([]map[string]interface{}, error) {
-// 	rows, err := db.Query(`
 // 		SELECT transaction_id, source, destination, amount, ballot_number, contact_server, status, created_at
 // 		FROM transactions
 // 		WHERE status = ?
 // 		ORDER BY created_at ASC`, status)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to fetch transactions with status %s: %v", status, err)
-// 	}
-// 	defer rows.Close()
-
-// 	transactions := make([]map[string]interface{}, 0)
-// 	for rows.Next() {
-// 		var txID, txStatus string
-// 		var source, destination, amount, ballot_number, contact_server int
-// 		var createdAt string
-// 		err := rows.Scan(&txID, &source, &destination, &amount, &ballot_number, &contact_server, &txStatus, &createdAt)
-// 		if err != nil {
-// 			return nil, err
-// 		}
-// 		transactions = append(transactions, map[string]interface{}{
-// 			"transaction_id": txID,
-// 			"source":         source,
-// 			"destination":    destination,
-// 			"amount":         amount,
-// 			"ballot_number":  ballot_number,
-// 			"contact_server": contact_server,
-// 			"status":         txStatus,
-// 			"created_at":     createdAt,
-// 		})
-// 	}
-// 	return transactions, nil
-// }
 
 // // Prints all client balances from the database
-// func PrintClients(db *sql.DB) error {
-// 	rows, err := db.Query(`SELECT client_id, balance FROM clients`)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to fetch clients: %v", err)
-// 	}
-// 	defer rows.Close()
 
-// 	fmt.Println("Client Balances:")
-// 	for rows.Next() {
-// 		var clientID, balance int
-// 		err := rows.Scan(&clientID, &balance)
-// 		if err != nil {
 // 			return err
-// 		}
-// 		fmt.Printf("  Client ID: %d, Balance: %d\n", clientID, balance)
-// 	}
-// 	return nil
-// }
 
 // Prints all committed transactions
-// func PrintDatastore(db *sql.DB) error {
-// 	rows, err := db.Query(`
 // 		SELECT transaction_id, source, destination, amount, status, created_at
 // 		FROM transactions
 // 		WHERE status = "committed"
 // 		ORDER BY created_at ASC`)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to fetch committed transactions: %v", err)
-// 	}
-// 	defer rows.Close()
 
-// 	fmt.Println("Committed Transactions:")
-// 	for rows.Next() {
-// 		var txID, status, createdAt string
-// 		var source, destination, amount int
-// 		err := rows.Scan(&txID, &source, &destination, &amount, &status, &createdAt)
-// 		if err != nil {
 // 			return err
-// 		}
-// 		fmt.Printf("  [%s] %d -> %d: %d (Status: %s, Created At: %s)\n", txID, source, destination, amount, status, createdAt)
-// 	}
-// 	return nil
-// }
 
 // Sets the lock for a specific client ID
 func SetLock(db *sql.DB, clientID int) error {
@@ -165,9 +95,9 @@ func IsLocked(db *sql.DB, clientID int) (bool, error) {
 }
 
 // GetAllTransactions retrieves all transactions from the database, ordered by creation time
-func GetAllTransactions(db *sql.DB) ([]map[string]interface{}, error) {
+func GetAllTransactions(db *sql.DB) ([]shared.Transaction, error) {
 	rows, err := db.Query(`
-		SELECT transaction_id, source, destination, amount, ballot_number, contact_server, status, created_at
+		SELECT transaction_id, source, destination, amount, ballot_number, ballot_server, contact_server, status, created_at
 		FROM transactions
 		ORDER BY created_at ASC`)
 	if err != nil {
@@ -175,23 +105,22 @@ func GetAllTransactions(db *sql.DB) ([]map[string]interface{}, error) {
 	}
 	defer rows.Close()
 
-	transactions := make([]map[string]interface{}, 0)
+	transactions := make([]shared.Transaction, 0)
 	for rows.Next() {
 		var txID, status, createdAt string
-		var source, destination, amount, ballot_number, contact_server int
-		err := rows.Scan(&txID, &source, &destination, &amount, &ballot_number, &contact_server, &status, &createdAt)
+		var source, destination, amount, ballotNumber, ballotServer, contactServer int
+		err := rows.Scan(&txID, &source, &destination, &amount, &ballotNumber, &ballotServer, &contactServer, &status, &createdAt)
 		if err != nil {
 			return nil, err
 		}
-		transactions = append(transactions, map[string]interface{}{
-			"transaction_id": txID,
-			"source":         source,
-			"destination":    destination,
-			"amount":         amount,
-			"ballot_number":  ballot_number,
-			"contact_server": contact_server,
-			"status":         status,
-			"created_at":     createdAt,
+		transactions = append(transactions, shared.Transaction{
+			TransactionID: txID,
+			Source:        source,
+			Destination:   destination,
+			Amount:        amount,
+			Ballot:        shared.Ballot{Number: ballotNumber, ServerID: ballotServer},
+			ContactServer: contactServer,
+			Status:        status,
 		})
 	}
 	return transactions, nil
@@ -201,7 +130,7 @@ func GetAllTransactions(db *sql.DB) ([]map[string]interface{}, error) {
 func GetTransaction(db *sql.DB, transactionID string) (shared.Transaction, error) {
 	var transaction shared.Transaction
 
-	query := `SELECT transaction_id, source, destination, amount, ballot_number, contact_server, status 
+	query := `SELECT transaction_id, source, destination, amount, ballot_number, ballot_server, contact_server, status 
 			  FROM transactions 
 			  WHERE transaction_id = ?`
 
@@ -211,7 +140,8 @@ func GetTransaction(db *sql.DB, transactionID string) (shared.Transaction, error
 		&transaction.Source,
 		&transaction.Destination,
 		&transaction.Amount,
-		&transaction.BallotNumber,
+		&transaction.Ballot.Number,
+		&transaction.Ballot.ServerID,
 		&transaction.ContactServer,
 		&transaction.Status,
 	)
