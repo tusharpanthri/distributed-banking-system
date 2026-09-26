@@ -1,0 +1,7 @@
+# The v1 lab is a separate module and is not part of the image.
+distributed-banking/
+frontend/
+docs/
+.github/
+.git/
+*.md

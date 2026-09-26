@@ -5,15 +5,54 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-
-defaults:
-  run:
-    working-directory: distributed-banking
+  # The heavy soak runs weekly rather than on every push. Randomised testing
+  # finds more the longer it runs, and a scheduled job can afford minutes that
+  # a pull request cannot.
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
 
 jobs:
-  build:
-    name: Build, vet and test
+  control-plane:
+    name: Control plane (root module)
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Verify formatting
+        run: |
+          unformatted=$(gofmt -l ./cmd ./internal)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Build
+        env:
+          CGO_ENABLED: 0
+        run: go build ./...
+
+      - name: Vet
+        env:
+          CGO_ENABLED: 0
+        run: go vet ./...
+
+      - name: Test with race detector
+        run: go test -race ./... -count=1
+
+  lab:
+    name: v1 lab (distributed-banking module)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: distributed-banking
     steps:
       - uses: actions/checkout@v4
 
@@ -46,3 +85,27 @@ jobs:
 
       - name: Test with race detector
         run: go test -race ./... -count=1
+
+  soak:
+    name: Chaos soak
+    # Only on the weekly schedule or when run by hand: this takes minutes, and
+    # every push already runs a short soak as part of the normal test job.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      # Thousands of operations against a cluster being killed and partitioned
+      # underneath them, checking that money is conserved, that replicas never
+      # commit different values at the same slot, that no key is left locked,
+      # and that no balance goes negative. Each run prints its seed, so a
+      # failure here is reproducible with -chaos.seed.
+      - name: Soak
+        run: |
+          go test -race ./internal/cluster             -run TestChaos -count=1             -chaos.runs=40 -chaos.ops=2000             -timeout=60m

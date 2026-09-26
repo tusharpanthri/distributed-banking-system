@@ -1,10 +1,261 @@
 # Distributed Banking System — Paxos + Two-Phase Commit
 
-A sharded, replicated bank ledger in Go. Accounts are partitioned across clusters; each cluster is replicated across several servers. **Paxos** keeps the replicas within a cluster agreed on one ordered log, and **two-phase commit** makes a transfer that spans two clusters atomic across both.
+A sharded, replicated ledger in Go, driven from a browser terminal. **Multi-Paxos**
+keeps each shard's replicas agreed on one ordered log, and **two-phase commit**
+makes a transfer spanning two shards atomic across both. Kill a node, split the
+network, and watch consensus refuse to lie about it.
 
-It started as a graduate distributed-systems lab. This version fixes several safety bugs in the original — the interesting part of the repo is arguably
+It began as a graduate distributed-systems lab. That lab is still here, in
+`distributed-banking/`, along with [what changed and why](#what-changed-and-why)
+— each safety bug it shipped with, paired with the test that fails without the
+fix. The control plane is a rewrite built on those lessons.
+
+![Killing the leader, watching it re-elect, then watching the survivor refuse](docs/screenshots/tour.gif)
+
+<sub>Killing a shard leader, watching the cluster elect a new one, then killing a
+second replica and watching the survivor refuse to commit alone. Recorded from a
+real session &mdash; see [how these are generated](docs/screenshots/).</sub>
 
 ---
+
+## Two things live here
+
+**`cmd/`, `internal/`, `frontend/`** — the control plane. A single Go binary
+running a sharded transaction cluster behind a WebSocket gateway, plus a
+one-file browser terminal that drives it. See [Control plane](#control-plane)
+below.
+
+**`distributed-banking/`** — v1, the original graduate lab and the safety fixes
+made to it. Its own Go module, unchanged and still green. Everything from
+[How it works](#how-it-works) down describes v1.
+
+---
+
+## Control plane
+
+A sharded transaction cluster driven from a browser terminal. Multi-Paxos
+replicates each shard; two-phase commit makes a transfer across two shards
+atomic. Kill nodes, split the network, watch consensus refuse to lie.
+
+```bash
+go run ./cmd/cluster
+```
+
+```bash
+cd frontend && python3 -m http.server 8081
+```
+
+Open <http://localhost:8081> and it connects to `ws://localhost:8080/ws` on its
+own. Type `demo` (or hit **run tour**) and it walks itself through the whole
+story &mdash; a commit, a cross-shard transfer, a killed leader, a lost quorum, a
+network split, and the recovery &mdash; narrating what to watch for. Or drive it
+yourself:
+
+```
+put tushar 100
+put ram 50
+transfer tushar ram 30       # 2PC if they hashed to different shards
+kill s0n0                   # the shard re-elects, live
+partition s0n0 s0n1 | s0n2  # now no group holds a majority
+status                      # leader=none, and writes abort
+heal
+```
+
+### How it works
+
+**Topology.** `-shards` by `-nodes` replicas, named `s{shard}n{index}`. Keys are
+assigned to shards by FNV-1a hash. Quorum is `n/2 + 1` — a strict majority, not
+`(n+1)/2`, which at n=4 would let two disjoint halves each think they had one.
+
+**Multi-Paxos per shard.** A leader wins the shard once with a prepare round,
+then every write is a single accept at the next log slot. Ballots are
+`<number, node>`, so two nodes reaching the same round number are still strictly
+ordered. An acceptor promises only upward, rejects accepts below its promise,
+and hands back what it has accepted so a new leader re-proposes in-flight values
+instead of overwriting them. Replicas apply strictly in slot order; one that
+fell behind gets backfilled by the leader rather than applying across a gap.
+
+**Election is the prepare phase.** There is no separate election protocol and no
+heartbeat timer. A command that finds no leader runs one; a command whose accept
+round misses quorum concludes it has lost the shard and re-elects. `kill`,
+`partition` and `heal` do not pick a leader — they invalidate what was known and
+let a real round find out. A leader stranded on the minority side of a split
+cannot reach a quorum, so it simply cannot win.
+
+**Two-phase commit across shards.** Each side runs its own Paxos round to record
+a prepared state, and that round reaching quorum is that shard's yes vote.
+Unanimity commits; anything else aborts. An abort reverses exactly what the
+prepare applied and releases its locks.
+
+**Failure lives in the transport.** `Transport` is an interface, and kill and
+partition are a filter sitting in front of it. Consensus never learns a node was
+"killed" — it sees a call that does not come back, which is all a real replica
+ever sees. That is what makes the same fault injection work for an in-process
+transport and a networked one, and what lets the whole cluster deploy as a
+single container.
+
+### What it looks like
+
+These are of the **control plane**, generated from a recorded session; see
+[`docs/screenshots/`](docs/screenshots/) for the pipeline. The v1 lab is driven
+by an interactive stdin menu that the recorder cannot drive, and was never
+captured.
+
+| | |
+|---|---|
+| **Cross-shard transfer** &mdash; two Paxos rounds under 2PC, both shards voting | [![Cross-shard 2PC](docs/screenshots/cross-shard-2pc.png)](docs/screenshots/cross-shard-2pc.png) |
+| **Converged logs** &mdash; every replica holding the same entries in the same order | [![Datastore](docs/screenshots/datastore-converged.png)](docs/screenshots/datastore-converged.png) |
+| **Leader killed** &mdash; re-elected at a higher ballot, no separate election protocol | [![Re-election](docs/screenshots/leader-reelection.png)](docs/screenshots/leader-reelection.png) |
+| **Quorum lost** &mdash; one replica of three, holding all the data, refusing anyway | [![No quorum](docs/screenshots/no-quorum-refuses.png)](docs/screenshots/no-quorum-refuses.png) |
+| **Partitioned** &mdash; three replicas alive, no majority group, no leader | [![Partitioned](docs/screenshots/partitioned-leaderless.png)](docs/screenshots/partitioned-leaderless.png) |
+| **Healed** &mdash; the split repaired, the shard electing on its own | [![Healed](docs/screenshots/heal-recovers.png)](docs/screenshots/heal-recovers.png) |
+
+### Flags
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-addr` | `:$PORT`, else `:8080` | Listen address |
+| `-shards` | `3` | Number of shards |
+| `-nodes` | `3` | Replicas per shard |
+| `-transport` | `inproc` | `inproc` or `grpc`. grpc is not implemented and errors rather than silently falling back |
+| `-pace` | `120ms` | Delay between log frames. Presentation only; `0` disables |
+| `-max-sessions` | `32` | Concurrent connections |
+
+### Two things that are deliberate
+
+**One cluster per connection.** Built when the socket opens, destroyed when it
+closes. A visitor who leaves the network in pieces cannot hand that to the next
+one. State is in memory and nothing persists.
+
+**Pacing is presentation, not simulation.** The `-pace` delay lives in the
+gateway's write loop, at the edge. Nothing sleeps inside consensus — a log
+stream that arrives as one instant dump is unreadable, but a Paxos round that
+slept would be lying about how fast the system is.
+
+### Deploying
+
+The backend is one container and the frontend is one static file. Both fit on
+free tiers.
+
+**Render** — push the repo and create a web service from the included
+[`render.yaml`](render.yaml), or point it at the [`Dockerfile`](Dockerfile) by
+hand. TLS is terminated by the platform, so the public endpoint is
+`wss://<app>.onrender.com/ws`.
+
+**fly.io** — [`fly.toml`](fly.toml) is included: `fly launch --no-deploy`, then
+`fly deploy`.
+
+**Frontend** — `frontend/index.html` is a single file with no build step. Drop
+it on Vercel, Netlify or GitHub Pages, then type the backend URL into the field
+in the header; it is remembered in `localStorage`.
+
+**The gotcha worth knowing before you hit it:** a page served over HTTPS cannot
+open a `ws://` connection. Browsers block it as mixed content and the failure is
+quiet. Behind Render or Fly the URL must be `wss://`. Only local development
+over `http://localhost` can use `ws://`. The frontend checks for this case and
+says so rather than failing silently.
+
+**Free tiers sleep.** Render's free plan spins down after about 15 minutes of
+inactivity, so the first connection after a quiet spell waits on a cold start;
+the Fly config here does the same by design. That is fine for a portfolio link
+and fine for nothing else. Check the current terms of either plan before relying
+on them — both have changed before.
+
+### Limits
+
+Per connection, so that a public endpoint does not become someone's free
+compute: 10 commands per second (burst 20), 256 distinct keys, 32 concurrent
+sessions, 4 KiB inbound frames, 10 minute idle timeout.
+
+### Layout
+
+```
+cmd/cluster/          the binary: flags, gateway, shutdown
+internal/logstream/   structured events; depends on nothing
+internal/transport/   Transport interface, in-process impl, fault injection
+internal/paxos/       ballots, acceptor, state machine, election, accept rounds
+internal/cluster/     the engine: shards plus the 2PC coordinator
+                      (chaos_test.go is the randomised soak)
+internal/gateway/     WebSocket, wire frames, command parser, session
+frontend/index.html   the terminal, one file, no build step
+tools/transcript/     records a scripted session off a real socket
+tools/render.py       draws that recording into the GIF and stills
+docs/protocol.md      the wire contract both sides are written against
+```
+
+### Chaos testing
+
+Alongside the scenario tests, a randomised soak runs thousands of operations
+against a cluster being killed and partitioned underneath them, then checks what
+the design actually promises:
+
+- money is conserved
+- no two replicas are ever committed on different values at the same slot
+- no key is left locked once the cluster recovers
+- no balance goes negative
+- a replica's state matches a fresh replay of its own committed log
+
+```bash
+go test ./internal/cluster -run TestChaos
+go test -race ./internal/cluster -run TestChaos -chaos.runs=40 -chaos.ops=2000
+```
+
+Every run prints its seed, and `-chaos.seed=<n>` replays a failure exactly. A
+short soak runs on every push; a long one runs weekly in CI.
+
+It earned its place immediately. Writing it surfaced five real defects, four of
+them in the consensus layer:
+
+| Found | Why it happened |
+|---|---|
+| Replicas committed **different values at the same slot** | `Commit` named only a slot number. A replica that missed the accept still held a stale entry there and committed *that*, while everyone else committed the real one. The same bug existed in the catch-up path. Both now carry the value, which is safe because a chosen value never changes. |
+| A transfer **reported failure after committing** | A leader that loses a quorum of replies cannot tell "not chosen" from "chosen, but I did not hear". It reported failure while the money had moved. Commands now carry an id, so the leader asks whether it already happened instead of guessing. |
+| Money **destroyed** by an abort that never arrived | A shard voting no may have prepared anyway, for the same reason. Aborting only the shards that voted yes left that one debited forever. The abort now goes to every participant; for a shard that never prepared it does nothing. |
+| Commands **applied twice** | A leader re-proposing at a fresh slot duplicates a command that was in fact chosen the first time. The state machine now ignores an id it has already applied. |
+| Two commands issued the **same id** | `cmdID` was called inside the two parallel prepare goroutines. Duplicate suppression would then discard one as an echo of the other and lose half a transfer. Found by `-race`. |
+
+The first is the one worth dwelling on: it is a straightforward safety violation,
+it survived every hand-written test in this repo, and no amount of staring at the
+code produced it. It took a thousand random operations and a partition landing in
+exactly the wrong microsecond.
+
+### What is not done
+
+- **The 2PC coordinator survives node failure, not process death.** Its decision
+  is recorded before any attempt to deliver it and retried until every shard has
+  it, so a shard that was unreachable at the deciding moment is resolved once it
+  comes back rather than being left prepared forever. The record lives in process
+  memory, which is honest about its limit: it does not survive the coordinator
+  process itself dying. Making it do so means writing the record somewhere
+  outside the process, which an in-memory demo has nowhere to put.
+- **A failed operation may still commit later.** A round accepted by a minority,
+  correctly reported as failed because no quorum could confirm it either way, can
+  be adopted and chosen by a later leader during recovery. The leader checks
+  whether a command already committed before reporting failure, which removes the
+  common case, but not the case where no quorum exists to ask. This is why the
+  chaos test asserts a sound interval rather than "failure means it did not
+  happen" — no system promises that without the caller consulting an outcome
+  registry.
+- **No gRPC transport yet.** The interface exists and the fault layer sits in
+  front of any implementation, which is the architecturally meaningful part. A
+  second implementation is what would prove the interface is not decorative.
+- **Elections are triggered by commands, not by heartbeats.** A real deployment
+  detects a dead leader with a heartbeat timeout. This cluster is idle between
+  keystrokes, and a heartbeat loop would burn CPU and flood the log stream to
+  discover, every 150ms, that nothing had changed. The election itself is a
+  genuine prepare round that can and does fail.
+- **The log is unbounded.** No snapshotting and no truncation. Acceptable for a
+  demo whose sessions are short by construction.
+
+---
+
+# v1 — the original lab
+
+Everything below this line describes `distributed-banking/`: the graduate
+distributed-systems lab this repo started as, and the safety bugs fixed in it.
+It is a separate Go module, still builds, and still passes its own suite. The
+control plane above is a rewrite, not a refactor of it — what carried over was
+the invariants and the tests, not the code.
 
 ## Contents
 
@@ -12,7 +263,6 @@ It started as a graduate distributed-systems lab. This version fixes several saf
 - [Quickstart](#quickstart)
 - [Running the tests](#running-the-tests)
 - [Failure demos](#failure-demos)
-- [Screenshots](#screenshots)
 - [What changed and why](#what-changed-and-why)
 - [Limitations](#limitations)
 - [Project layout](#project-layout)
@@ -122,25 +372,6 @@ The sequence worth demonstrating:
 2. Crash one replica in a cluster (2 of 3 alive) → still commits, quorum holds.
 3. Crash a second (1 of 3 alive) → the leader **refuses**; balances unchanged.
 4. Restore both, run another transfer → the recovered replicas catch up.
-
----
-
-## Screenshots
-
-Captures live in [`docs/screenshots/`](docs/screenshots/). See that directory's README for the exact capture checklist.
-
-| | |
-|---|---|
-| **Cluster startup** — 3×3 topology initialising | ![Cluster startup](docs/screenshots/01-cluster-startup.png) |
-| **Intra-shard commit** — one Paxos round | ![Intra-shard commit](docs/screenshots/02-intra-shard-commit.png) |
-| **Cross-shard commit** — two rounds under 2PC | ![Cross-shard commit](docs/screenshots/03-cross-shard-commit.png) |
-| **Cross-shard abort** — insufficient funds | ![Cross-shard abort](docs/screenshots/04-cross-shard-abort.png) |
-| **Minority down** — consensus still reached | ![Minority down](docs/screenshots/05-minority-down-commits.png) |
-| **Majority down** — leader refuses | ![Majority down](docs/screenshots/06-majority-down-refuses.png) |
-| **Recovery** — restarted replica catches up | ![Recovery](docs/screenshots/07-recovery-catch-up.png) |
-| **Datastore** — identical logs across replicas | ![Datastore](docs/screenshots/08-datastore-converged.png) |
-| **Performance** — throughput and latency | ![Performance](docs/screenshots/09-performance.png) |
-| **Test suite** — green under `-race` | ![Tests](docs/screenshots/10-tests-green.png) |
 
 ---
 

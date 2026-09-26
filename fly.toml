@@ -1,0 +1,31 @@
+# fly.io alternative to Render. `fly launch --no-deploy` then `fly deploy`.
+#
+# auto_stop_machines / min_machines_running = 0 keeps this inside the free
+# allowance: the machine sleeps when idle and wakes on the next request. That
+# costs a few seconds of cold start, and since cluster state is in memory it
+# also means a sleeping machine forgets everything — which is already true of
+# this demo by design.
+
+app = "distributed-txn-control-plane"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    grace_period = "5s"
+    interval = "30s"
+    method = "GET"
+    path = "/healthz"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

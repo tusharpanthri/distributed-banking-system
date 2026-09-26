@@ -1,0 +1,18 @@
+# Compiled binaries from `go build` in a package directory. These are anchored
+# with a leading slash: a bare "cluster" would also match the cmd/cluster and
+# internal/cluster source directories.
+/cluster
+/cluster.exe
+/distributed-banking.exe
+*.test
+*.exe
+
+# The v1 lab writes one SQLite file per replica next to the binary.
+distributed-banking/db_*.db
+distributed-banking/db_*.db-journal
+distributed-banking/db_*.db-wal
+distributed-banking/db_*.db-shm
+
+# Go coverage output.
+*.out
+coverage.html

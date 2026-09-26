@@ -1,0 +1,19 @@
+# Render blueprint. Point Render at this repo and it picks this up, or create
+# the service by hand with the same settings.
+#
+# The free plan spins the instance down after ~15 minutes of inactivity, so the
+# first connection after a quiet spell waits on a cold start. For a portfolio
+# demo that is an acceptable trade; the frontend shows a "connecting" state
+# while it happens.
+
+services:
+  - type: web
+    name: distributed-txn-control-plane
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      # Render injects PORT itself; the binary reads it. Nothing else is needed.
+      - key: GOMAXPROCS
+        value: "1"

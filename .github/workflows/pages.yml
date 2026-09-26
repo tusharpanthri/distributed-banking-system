@@ -1,0 +1,45 @@
+name: Deploy frontend to Pages
+
+# The frontend is a single static file, so it is published straight from the
+# repository rather than built. GitHub Pages never sleeps, which is the point of
+# hosting it separately from the backend: the page always loads instantly, even
+# while a free-tier backend is still waking up.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# A queued run replaces an older one rather than piling up, but an in-flight
+# deploy is allowed to finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/configure-pages@v5
+
+      - name: Upload frontend
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: frontend
+
+      - name: Deploy
+        id: deploy
+        uses: actions/deploy-pages@v4

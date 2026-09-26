@@ -1,0 +1,190 @@
+{"type":"log","level":"info","tag":"[gw]","msg":"fresh cluster: 3 shards x 3 nodes, quorum 2"}
+{"type":"log","level":"info","tag":"[gw]","msg":"this cluster is yours alone and resets when you disconnect. type help"}
+{"type":"log","level":"paxos","tag":"[s0]","msg":"PREPARE \u003c1,s0n0\u003e from s0n0"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"PREPARE \u003c1,s2n0\u003e from s2n0"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"PREPARE \u003c1,s1n0\u003e from s1n0"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"PROMISE 3/3 for \u003c1,s2n0\u003e, quorum reached"}
+{"type":"log","level":"leader","tag":"[s2]","msg":"s2n0 leads s2 at \u003c1,s2n0\u003e"}
+{"type":"log","level":"paxos","tag":"[s0]","msg":"PROMISE 3/3 for \u003c1,s0n0\u003e, quorum reached"}
+{"type":"log","level":"leader","tag":"[s0]","msg":"s0n0 leads s0 at \u003c1,s0n0\u003e"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"PROMISE 3/3 for \u003c1,s1n0\u003e, quorum reached"}
+{"type":"log","level":"leader","tag":"[s1]","msg":"s1n0 leads s1 at \u003c1,s1n0\u003e"}
+{"type":"result","msg":"OK cluster up, 3/3 shards led"}
+{"type":"narr","msg":"a fresh cluster: 3 shards, 3 replicas each. a majority is 2."}
+{"type":"cmd","msg":"status"}
+{"type":"log","level":"client","tag":"[you]","msg":"status"}
+{"type":"log","level":"leader","tag":"[s0]","msg":"leader=s0n0 term=1 alive=3/3 needs=2  *s0n0:up s0n1:up s0n2:up"}
+{"type":"log","level":"leader","tag":"[s1]","msg":"leader=s1n0 term=1 alive=3/3 needs=2  *s1n0:up s1n1:up s1n2:up"}
+{"type":"log","level":"leader","tag":"[s2]","msg":"leader=s2n0 term=1 alive=3/3 needs=2  *s2n0:up s2n1:up s2n2:up"}
+{"type":"log","level":"info","tag":"[keys]","msg":"no keys yet, try: put tushar 100"}
+{"type":"result","msg":"OK 3 shards, 3 writable, 0 keys"}
+{"type":"narr","msg":"every write is one paxos round. the leader proposes, a majority accepts, then it commits."}
+{"type":"cmd","msg":"put tushar 100"}
+{"type":"log","level":"client","tag":"[you]","msg":"put tushar 100"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPT slot=1 \u003c1,s2n0\u003e put tushar=100"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPTED 3/3, value chosen"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"COMMIT slot=1 put tushar=100"}
+{"type":"result","msg":"OK tushar=100 on s2"}
+{"type":"cmd","msg":"put ram 50"}
+{"type":"log","level":"client","tag":"[you]","msg":"put ram 50"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPT slot=2 \u003c1,s2n0\u003e put ram=50"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPTED 3/3, value chosen"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"COMMIT slot=2 put ram=50"}
+{"type":"result","msg":"OK ram=50 on s2"}
+{"type":"narr","msg":"tushar and ram hashed to the same shard, so one log entry moves the money. no 2pc needed."}
+{"type":"cmd","msg":"transfer tushar ram 30"}
+{"type":"log","level":"client","tag":"[you]","msg":"transfer tushar ram 30"}
+{"type":"log","level":"twopc","tag":"[2PC]","msg":"tushar and ram are both on s2: single Paxos round, no 2PC"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPT slot=3 \u003c1,s2n0\u003e transfer tushar-\u003eram 30"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPTED 3/3, value chosen"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"COMMIT slot=3 transfer tushar-\u003eram 30"}
+{"type":"result","msg":"OK moved 30 from tushar to ram"}
+{"type":"narr","msg":"varun hashed to a different shard."}
+{"type":"cmd","msg":"put varun 40"}
+{"type":"log","level":"client","tag":"[you]","msg":"put varun 40"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"ACCEPT slot=1 \u003c1,s1n0\u003e put varun=40"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"ACCEPTED 3/3, value chosen"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"COMMIT slot=1 put varun=40"}
+{"type":"result","msg":"OK varun=40 on s1"}
+{"type":"narr","msg":"so this transfer has to cross shards. each side runs its own paxos round, and reaching quorum IS that shard's vote. unanimous means commit."}
+{"type":"cmd","msg":"transfer tushar varun 25"}
+{"type":"log","level":"client","tag":"[you]","msg":"transfer tushar varun 25"}
+{"type":"log","level":"twopc","tag":"[2PC]","msg":"BEGIN tx1: tushar(s2) -\u003e varun(s1) amount 25"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"ACCEPT slot=2 \u003c1,s1n0\u003e prepare tx1 varun+25"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPT slot=4 \u003c1,s2n0\u003e prepare tx1 tushar-25"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPTED 3/3, value chosen"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"ACCEPTED 3/3, value chosen"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"COMMIT slot=2 prepare tx1 varun+25"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"COMMIT slot=4 prepare tx1 tushar-25"}
+{"type":"log","level":"twopc","tag":"[2PC]","msg":"s2 votes YES"}
+{"type":"log","level":"twopc","tag":"[2PC]","msg":"s1 votes YES"}
+{"type":"log","level":"twopc","tag":"[2PC]","msg":"COMMIT tx1: both shards voted yes"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"ACCEPT slot=3 \u003c1,s1n0\u003e commit tx1"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPT slot=5 \u003c1,s2n0\u003e commit tx1"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPTED 3/3, value chosen"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"ACCEPTED 3/3, value chosen"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"COMMIT slot=3 commit tx1"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"COMMIT slot=5 commit tx1"}
+{"type":"result","msg":"OK moved 25 from tushar to varun"}
+{"type":"narr","msg":"every replica holds the same entries, in the same order, under the same ballots."}
+{"type":"cmd","msg":"datastore"}
+{"type":"log","level":"client","tag":"[you]","msg":"datastore"}
+{"type":"log","level":"paxos","tag":"[log]","msg":"s0n0: (empty)"}
+{"type":"log","level":"paxos","tag":"[log]","msg":"s0n1: (empty)"}
+{"type":"log","level":"paxos","tag":"[log]","msg":"s0n2: (empty)"}
+{"type":"log","level":"paxos","tag":"[log]","msg":"s1n0: \u003c1,s1n0\u003eput varun=40 -\u003e \u003c1,s1n0\u003eprepare tx1 varun+25 -\u003e \u003c1,s1n0\u003ecommit tx1"}
+{"type":"log","level":"paxos","tag":"[log]","msg":"s1n1: \u003c1,s1n0\u003eput varun=40 -\u003e \u003c1,s1n0\u003eprepare tx1 varun+25 -\u003e \u003c1,s1n0\u003ecommit tx1"}
+{"type":"log","level":"paxos","tag":"[log]","msg":"s1n2: \u003c1,s1n0\u003eput varun=40 -\u003e \u003c1,s1n0\u003eprepare tx1 varun+25 -\u003e \u003c1,s1n0\u003ecommit tx1"}
+{"type":"log","level":"paxos","tag":"[log]","msg":"s2n0: \u003c1,s2n0\u003eput tushar=100 -\u003e \u003c1,s2n0\u003eput ram=50 -\u003e \u003c1,s2n0\u003etransfer tushar-\u003eram 30 -\u003e \u003c1,s2n0\u003eprepare tx1 tushar-25 -\u003e \u003c1,s2n0\u003ecommit tx1"}
+{"type":"log","level":"paxos","tag":"[log]","msg":"s2n1: \u003c1,s2n0\u003eput tushar=100 -\u003e \u003c1,s2n0\u003eput ram=50 -\u003e \u003c1,s2n0\u003etransfer tushar-\u003eram 30 -\u003e \u003c1,s2n0\u003eprepare tx1 tushar-25 -\u003e \u003c1,s2n0\u003ecommit tx1"}
+{"type":"log","level":"paxos","tag":"[log]","msg":"s2n2: \u003c1,s2n0\u003eput tushar=100 -\u003e \u003c1,s2n0\u003eput ram=50 -\u003e \u003c1,s2n0\u003etransfer tushar-\u003eram 30 -\u003e \u003c1,s2n0\u003eprepare tx1 tushar-25 -\u003e \u003c1,s2n0\u003ecommit tx1"}
+{"type":"result","msg":"OK 9 replicas"}
+{"type":"narr","msg":"now break it. kill the leader of tushar's shard."}
+{"type":"cmd","msg":"kill s2n0"}
+{"type":"log","level":"client","tag":"[you]","msg":"kill s2n0"}
+{"type":"log","level":"leader","tag":"[s2]","msg":"s2n0 is no longer leader: the node was killed"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"PREPARE \u003c2,s2n1\u003e from s2n1"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"PROMISE 2/3 for \u003c2,s2n1\u003e, quorum reached"}
+{"type":"log","level":"leader","tag":"[s2]","msg":"s2n1 leads s2 at \u003c2,s2n1\u003e"}
+{"type":"result","msg":"OK s2n0 is down"}
+{"type":"narr","msg":"a new leader was elected at a higher ballot. there is no separate election protocol here - electing IS the paxos prepare phase."}
+{"type":"cmd","msg":"transfer tushar varun 10"}
+{"type":"log","level":"client","tag":"[you]","msg":"transfer tushar varun 10"}
+{"type":"log","level":"twopc","tag":"[2PC]","msg":"BEGIN tx2: tushar(s2) -\u003e varun(s1) amount 10"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"ACCEPT slot=4 \u003c1,s1n0\u003e prepare tx2 varun+10"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPT slot=6 \u003c2,s2n1\u003e prepare tx2 tushar-10"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPTED 2/3, value chosen"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"ACCEPTED 3/3, value chosen"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"COMMIT slot=4 prepare tx2 varun+10"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"COMMIT slot=6 prepare tx2 tushar-10"}
+{"type":"log","level":"twopc","tag":"[2PC]","msg":"s2 votes YES"}
+{"type":"log","level":"twopc","tag":"[2PC]","msg":"s1 votes YES"}
+{"type":"log","level":"twopc","tag":"[2PC]","msg":"COMMIT tx2: both shards voted yes"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"ACCEPT slot=5 \u003c1,s1n0\u003e commit tx2"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPT slot=7 \u003c2,s2n1\u003e commit tx2"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"ACCEPTED 3/3, value chosen"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPTED 2/3, value chosen"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"COMMIT slot=7 commit tx2"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"COMMIT slot=5 commit tx2"}
+{"type":"result","msg":"OK moved 10 from tushar to varun"}
+{"type":"narr","msg":"two of three is still a majority, so that worked. kill a second replica."}
+{"type":"cmd","msg":"kill s2n1"}
+{"type":"log","level":"client","tag":"[you]","msg":"kill s2n1"}
+{"type":"log","level":"leader","tag":"[s2]","msg":"s2n1 is no longer leader: the node was killed"}
+{"type":"log","level":"leader","tag":"[s2]","msg":"s2 has no leader: shard s2: no quorum (1/3 alive, needs 2)"}
+{"type":"result","msg":"OK s2n1 is down"}
+{"type":"narr","msg":"one replica left out of three. it holds all the data and it still refuses, because committing alone is how you lose money."}
+{"type":"cmd","msg":"put tushar 999"}
+{"type":"log","level":"client","tag":"[you]","msg":"put tushar 999"}
+{"type":"result","msg":"ABORT shard s2: no quorum (1/3 alive, needs 2)"}
+{"type":"narr","msg":"bring them back. a revived replica returns with the log it died with."}
+{"type":"cmd","msg":"revive s2n0"}
+{"type":"log","level":"client","tag":"[you]","msg":"revive s2n0"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"PREPARE \u003c3,s2n0\u003e from s2n0"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"PROMISE 2/3 for \u003c3,s2n0\u003e, quorum reached"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPT slot=6 \u003c3,s2n0\u003e prepare tx2 tushar-10"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPTED 2/3, value chosen"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"COMMIT slot=6 prepare tx2 tushar-10"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPT slot=7 \u003c3,s2n0\u003e commit tx2"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPTED 2/3, value chosen"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"COMMIT slot=7 commit tx2"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"recovered 2 unfinished slot(s) from the previous leader"}
+{"type":"log","level":"leader","tag":"[s2]","msg":"s2n0 leads s2 at \u003c3,s2n0\u003e"}
+{"type":"result","msg":"OK s2n0 is up"}
+{"type":"cmd","msg":"revive s2n1"}
+{"type":"log","level":"client","tag":"[you]","msg":"revive s2n1"}
+{"type":"result","msg":"OK s2n1 is up"}
+{"type":"narr","msg":"now split the network instead of killing anything. all three replicas stay alive - they just cannot reach each other."}
+{"type":"cmd","msg":"partition s2n0 | s2n1 | s2n2"}
+{"type":"log","level":"client","tag":"[you]","msg":"partition s2n0 | s2n1 | s2n2"}
+{"type":"log","level":"leader","tag":"[s0]","msg":"s0n0 is no longer leader: the network was partitioned"}
+{"type":"log","level":"paxos","tag":"[s0]","msg":"PREPARE \u003c2,s0n0\u003e from s0n0"}
+{"type":"log","level":"paxos","tag":"[s0]","msg":"PROMISE 3/3 for \u003c2,s0n0\u003e, quorum reached"}
+{"type":"log","level":"leader","tag":"[s0]","msg":"s0n0 leads s0 at \u003c2,s0n0\u003e"}
+{"type":"log","level":"leader","tag":"[s1]","msg":"s1n0 is no longer leader: the network was partitioned"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"PREPARE \u003c2,s1n0\u003e from s1n0"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"PROMISE 3/3 for \u003c2,s1n0\u003e, quorum reached"}
+{"type":"log","level":"leader","tag":"[s1]","msg":"s1n0 leads s1 at \u003c2,s1n0\u003e"}
+{"type":"log","level":"leader","tag":"[s2]","msg":"s2n0 is no longer leader: the network was partitioned"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"PREPARE \u003c4,s2n0\u003e from s2n0"}
+{"type":"log","level":"net","tag":"[net]","msg":"dropped Prepare s2n0 -\u003e s2n2 (partitioned)"}
+{"type":"log","level":"net","tag":"[net]","msg":"dropped Prepare s2n0 -\u003e s2n1 (partitioned)"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"PROMISE 1/3 for \u003c4,s2n0\u003e, short of quorum 2"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"PREPARE \u003c5,s2n1\u003e from s2n1"}
+{"type":"log","level":"net","tag":"[net]","msg":"dropped Prepare s2n1 -\u003e s2n2 (partitioned)"}
+{"type":"log","level":"net","tag":"[net]","msg":"dropped Prepare s2n1 -\u003e s2n0 (partitioned)"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"PROMISE 1/3 for \u003c5,s2n1\u003e, short of quorum 2"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"PREPARE \u003c6,s2n2\u003e from s2n2"}
+{"type":"log","level":"net","tag":"[net]","msg":"dropped Prepare s2n2 -\u003e s2n0 (partitioned)"}
+{"type":"log","level":"net","tag":"[net]","msg":"dropped Prepare s2n2 -\u003e s2n1 (partitioned)"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"PROMISE 1/3 for \u003c6,s2n2\u003e, short of quorum 2"}
+{"type":"log","level":"leader","tag":"[s2]","msg":"s2 has no leader: shard s2: no leader (no replica could reach a quorum of promises)"}
+{"type":"result","msg":"OK network split into 3 groups"}
+{"type":"narr","msg":"3 of 3 alive, and no leader. liveness is not reachability, and a dead-node count cannot express this."}
+{"type":"cmd","msg":"status"}
+{"type":"log","level":"client","tag":"[you]","msg":"status"}
+{"type":"log","level":"leader","tag":"[s0]","msg":"leader=s0n0 term=2 alive=3/3 needs=2  *s0n0:up s0n1:up s0n2:up"}
+{"type":"log","level":"leader","tag":"[s1]","msg":"leader=s1n0 term=2 alive=3/3 needs=2  *s1n0:up s1n1:up s1n2:up"}
+{"type":"log","level":"leader","tag":"[s2]","msg":"leader=none term=3 alive=3/3 needs=2  s2n0:up s2n1:up s2n2:up"}
+{"type":"log","level":"net","tag":"[net]","msg":"partitioned: {s2n0} | {s2n1} | {s2n2}"}
+{"type":"log","level":"info","tag":"[s2]","msg":"ram = 80"}
+{"type":"log","level":"info","tag":"[s2]","msg":"tushar = 35"}
+{"type":"log","level":"info","tag":"[s1]","msg":"varun = 75"}
+{"type":"result","msg":"OK 3 shards, 2 writable, 3 keys"}
+{"type":"narr","msg":"heal the split and the shard elects again on its own."}
+{"type":"cmd","msg":"heal"}
+{"type":"log","level":"client","tag":"[you]","msg":"heal"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"PREPARE \u003c7,s2n0\u003e from s2n0"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"PROMISE 3/3 for \u003c7,s2n0\u003e, quorum reached"}
+{"type":"log","level":"leader","tag":"[s2]","msg":"s2n0 leads s2 at \u003c7,s2n0\u003e"}
+{"type":"result","msg":"OK partitions removed"}
+{"type":"narr","msg":"that's the tour. the cluster is yours - break it however you like."}
+{"type":"cmd","msg":"status"}
+{"type":"log","level":"client","tag":"[you]","msg":"status"}
+{"type":"log","level":"leader","tag":"[s0]","msg":"leader=s0n0 term=2 alive=3/3 needs=2  *s0n0:up s0n1:up s0n2:up"}
+{"type":"log","level":"leader","tag":"[s1]","msg":"leader=s1n0 term=2 alive=3/3 needs=2  *s1n0:up s1n1:up s1n2:up"}
+{"type":"log","level":"leader","tag":"[s2]","msg":"leader=s2n0 term=7 alive=3/3 needs=2  *s2n0:up s2n1:up s2n2:up"}
+{"type":"log","level":"info","tag":"[s2]","msg":"ram = 80"}
+{"type":"log","level":"info","tag":"[s2]","msg":"tushar = 35"}
+{"type":"log","level":"info","tag":"[s1]","msg":"varun = 75"}
+{"type":"result","msg":"OK 3 shards, 3 writable, 3 keys"}
