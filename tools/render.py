@@ -64,14 +64,24 @@ GIF_TO = "put tushar 999"           # command whose result closes it
 # actually zoom into.
 GIF_SCALE = 0.72
 
-# Stills worth keeping, keyed by a substring of the command that produces them.
+# Stills worth keeping, keyed by the command that produces them. A command that
+# appears more than once in the script keeps its LAST occurrence, which is why
+# "status" yields the final state rather than the opening one.
+#
+# The empty key is the connect banner: it is the only exchange that arrives
+# before any command has been sent, so it is the one way to capture startup.
 STILLS = {
+    "": "startup-election.png",
+    "put tushar 100": "first-write-paxos.png",
+    "transfer tushar ram 30": "intra-shard-single-round.png",
     "transfer tushar varun 25": "cross-shard-2pc.png",
     "datastore": "datastore-converged.png",
     "kill s2n0": "leader-reelection.png",
     "put tushar 999": "no-quorum-refuses.png",
+    "revive s2n1": "replica-rejoins.png",
     "partition s2n0 | s2n1 | s2n2": "partitioned-leaderless.png",
     "heal": "heal-recovers.png",
+    "status": "cluster-status.png",
 }
 
 

@@ -63,29 +63,105 @@ heal
 
 ### How it works
 
-**Topology.** `-shards` by `-nodes` replicas, named `s{shard}n{index}`. Keys are
-assigned to shards by FNV-1a hash. Quorum is `n/2 + 1` — a strict majority, not
-`(n+1)/2`, which at n=4 would let two disjoint halves each think they had one.
+Every screenshot below is a frame from a real recorded session — the same
+session that produces the GIF above. Nothing is mocked up or retouched; see
+[`docs/screenshots/`](docs/screenshots/) for the pipeline that generates them.
 
-**Multi-Paxos per shard.** A leader wins the shard once with a prepare round,
-then every write is a single accept at the next log slot. Ballots are
-`<number, node>`, so two nodes reaching the same round number are still strictly
-ordered. An acceptor promises only upward, rejects accepts below its promise,
-and hands back what it has accepted so a new leader re-proposes in-flight values
-instead of overwriting them. Replicas apply strictly in slot order; one that
-fell behind gets backfilled by the leader rather than applying across a gap.
+#### Topology
 
-**Election is the prepare phase.** There is no separate election protocol and no
-heartbeat timer. A command that finds no leader runs one; a command whose accept
-round misses quorum concludes it has lost the shard and re-elects. `kill`,
-`partition` and `heal` do not pick a leader — they invalidate what was known and
-let a real round find out. A leader stranded on the minority side of a split
-cannot reach a quorum, so it simply cannot win.
+`-shards` by `-nodes` replicas, named `s{shard}n{index}`. Keys are assigned to
+shards by FNV-1a hash. Quorum is `n/2 + 1` — a strict majority, not `(n+1)/2`,
+which at n=4 would let two disjoint halves each think they had one.
 
-**Two-phase commit across shards.** Each side runs its own Paxos round to record
-a prepared state, and that round reaching quorum is that shard's yes vote.
-Unanimity commits; anything else aborts. An abort reverses exactly what the
-prepare applied and releases its locks.
+Nothing is pre-assigned at boot. Each shard runs a genuine prepare round to find
+a leader, and the ballot it wins under is visible in the log:
+
+[![Startup: three shards each electing a leader](docs/screenshots/startup-election.png)](docs/screenshots/startup-election.png)
+
+<sub>A fresh cluster. Three shards, three replicas each, quorum 2. Each shard
+sends `PREPARE <1,sNn0>`, collects `PROMISE 3/3`, and only then claims
+leadership.</sub>
+
+#### Multi-Paxos per shard
+
+A leader wins the shard once with a prepare round, then every write is a single
+accept at the next log slot. Ballots are `<number, node>`, so two nodes reaching
+the same round number are still strictly ordered. An acceptor promises only
+upward, rejects accepts below its promise, and hands back what it has accepted
+so a new leader re-proposes in-flight values instead of overwriting them.
+Replicas apply strictly in slot order; one that fell behind gets backfilled by
+the leader rather than applying across a gap.
+
+[![A single write moving through accept, chosen, commit](docs/screenshots/first-write-paxos.png)](docs/screenshots/first-write-paxos.png)
+
+<sub>One write, one round: `ACCEPT slot=1 <1,s2n0>` → `ACCEPTED 3/3, value
+chosen` → `COMMIT`. The leader was already established, so there is no prepare
+here — that is what makes it *multi*-Paxos.</sub>
+
+#### A transfer inside one shard
+
+When both keys hash to the same shard, the whole transfer is one log entry. No
+coordinator, no votes, nothing to abort:
+
+[![An intra-shard transfer in a single Paxos round](docs/screenshots/intra-shard-single-round.png)](docs/screenshots/intra-shard-single-round.png)
+
+<sub>`tushar` and `ram` both landed on `s2`, so the transfer is a single Paxos
+round at slot 3 — the `[2PC]` line says so explicitly before skipping itself.</sub>
+
+#### Two-phase commit across shards
+
+When the keys live on different shards, each side runs its own Paxos round to
+record a prepared state, and **that round reaching quorum is that shard's yes
+vote**. Unanimity commits; anything else aborts. An abort reverses exactly what
+the prepare applied and releases its locks.
+
+[![A cross-shard transfer: two prepares, two votes, commit](docs/screenshots/cross-shard-2pc.png)](docs/screenshots/cross-shard-2pc.png)
+
+<sub>`prepare tx1 tushar-25` on `s2` and `varun+25` on `s1` run in parallel,
+each committing its prepared state through its own quorum. `s2 votes YES`,
+`s1 votes YES`, then `COMMIT tx1: both shards voted yes`. This is the
+single most load-bearing screenshot in the repo.</sub>
+
+#### Replicas converge
+
+[![Every replica holding the same log](docs/screenshots/datastore-converged.png)](docs/screenshots/datastore-converged.png)
+
+<sub>`datastore` prints every replica's committed log side by side — same
+entries, same order, same ballots. Shards holding no keys print empty rather
+than being hidden.</sub>
+
+#### Election is the prepare phase
+
+There is no separate election protocol and no heartbeat timer. A command that
+finds no leader runs one; a command whose accept round misses quorum concludes
+it has lost the shard and re-elects. `kill`, `partition` and `heal` do not pick
+a leader — they invalidate what was known and let a real round find out.
+
+[![A killed leader replaced at a higher ballot](docs/screenshots/leader-reelection.png)](docs/screenshots/leader-reelection.png)
+
+<sub>The leader of `s2` is killed. The next command discovers it, runs a prepare
+at a higher ballot, and the shard carries on — at `ACCEPTED 2/3`, because two of
+three is still a majority.</sub>
+
+#### Losing quorum
+
+[![One replica of three refusing to commit alone](docs/screenshots/no-quorum-refuses.png)](docs/screenshots/no-quorum-refuses.png)
+
+<sub>A second replica dies. The survivor holds all the data and still refuses:
+`ABORT shard s2: no quorum (1/3 alive, needs 2)`. Committing alone is how you
+lose money.</sub>
+
+#### A partition is not a dead-node count
+
+A leader stranded on the minority side of a split cannot reach a quorum, so it
+simply cannot win. This is the case a liveness check based on counting dead
+nodes gets wrong:
+
+[![Three replicas alive, fully partitioned, no leader](docs/screenshots/partitioned-leaderless.png)](docs/screenshots/partitioned-leaderless.png)
+
+<sub>All three replicas are **up**, and the shard still has no leader. Each one
+campaigns, each gets `PROMISE 1/3, short of quorum 2`, and the prepares are
+visibly `dropped ... (partitioned)` by the transport.</sub>
 
 **Failure lives in the transport.** `Transport` is an interface, and kill and
 partition are a filter sitting in front of it. Consensus never learns a node was
@@ -94,21 +170,31 @@ ever sees. That is what makes the same fault injection work for an in-process
 transport and a networked one, and what lets the whole cluster deploy as a
 single container.
 
-### What it looks like
+#### Recovery
 
-These are of the **control plane**, generated from a recorded session; see
-[`docs/screenshots/`](docs/screenshots/) for the pipeline. The v1 lab is driven
-by an interactive stdin menu that the recorder cannot drive, and was never
-captured.
+[![A revived replica rejoining and finishing interrupted work](docs/screenshots/replica-rejoins.png)](docs/screenshots/replica-rejoins.png)
 
-| | |
-|---|---|
-| **Cross-shard transfer** &mdash; two Paxos rounds under 2PC, both shards voting | [![Cross-shard 2PC](docs/screenshots/cross-shard-2pc.png)](docs/screenshots/cross-shard-2pc.png) |
-| **Converged logs** &mdash; every replica holding the same entries in the same order | [![Datastore](docs/screenshots/datastore-converged.png)](docs/screenshots/datastore-converged.png) |
-| **Leader killed** &mdash; re-elected at a higher ballot, no separate election protocol | [![Re-election](docs/screenshots/leader-reelection.png)](docs/screenshots/leader-reelection.png) |
-| **Quorum lost** &mdash; one replica of three, holding all the data, refusing anyway | [![No quorum](docs/screenshots/no-quorum-refuses.png)](docs/screenshots/no-quorum-refuses.png) |
-| **Partitioned** &mdash; three replicas alive, no majority group, no leader | [![Partitioned](docs/screenshots/partitioned-leaderless.png)](docs/screenshots/partitioned-leaderless.png) |
-| **Healed** &mdash; the split repaired, the shard electing on its own | [![Healed](docs/screenshots/heal-recovers.png)](docs/screenshots/heal-recovers.png) |
+<sub>The refusal, then the repair. A revived replica restores quorum, and the
+new leader finds work the dead one left half-done: `recovered 2 unfinished
+slot(s) from the previous leader`. The prepared 2PC transaction is carried to
+its commit rather than being stranded.</sub>
+
+[![The split healed and the shard re-electing](docs/screenshots/heal-recovers.png)](docs/screenshots/heal-recovers.png)
+
+<sub>`heal` removes the partition. Nobody appoints a leader — `s2` campaigns
+again at `<7,s2n0>`, gets `PROMISE 3/3`, and takes the shard back on its own.</sub>
+
+#### Where it ends up
+
+[![Final cluster status with balances intact](docs/screenshots/cluster-status.png)](docs/screenshots/cluster-status.png)
+
+<sub>After two kills, a revive, and a three-way partition: all shards led again,
+`s2` at term 7 from its churn while the untouched shards sit at term 2 — and
+`ram = 80`, `tushar = 35`, `varun = 75`. The money is exactly where it should
+be.</sub>
+
+<sub>The v1 lab in `distributed-banking/` is driven by an interactive stdin menu
+that this recorder cannot drive, and was never captured.</sub>
 
 ### Flags
 

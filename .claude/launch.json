@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "cluster-backend",
+      "runtimeExecutable": "go",
+      "runtimeArgs": ["run", "./cmd/cluster", "-addr", ":8090"],
+      "port": 8090
+    },
+    {
+      "name": "frontend",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "5173", "--directory", "frontend"],
+      "port": 5173
+    }
+  ]
+}

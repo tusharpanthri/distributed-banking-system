@@ -1,14 +1,14 @@
 {"type":"log","level":"info","tag":"[gw]","msg":"fresh cluster: 3 shards x 3 nodes, quorum 2"}
 {"type":"log","level":"info","tag":"[gw]","msg":"this cluster is yours alone and resets when you disconnect. type help"}
-{"type":"log","level":"paxos","tag":"[s0]","msg":"PREPARE \u003c1,s0n0\u003e from s0n0"}
 {"type":"log","level":"paxos","tag":"[s2]","msg":"PREPARE \u003c1,s2n0\u003e from s2n0"}
+{"type":"log","level":"paxos","tag":"[s0]","msg":"PREPARE \u003c1,s0n0\u003e from s0n0"}
 {"type":"log","level":"paxos","tag":"[s1]","msg":"PREPARE \u003c1,s1n0\u003e from s1n0"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"PROMISE 3/3 for \u003c1,s1n0\u003e, quorum reached"}
+{"type":"log","level":"leader","tag":"[s1]","msg":"s1n0 leads s1 at \u003c1,s1n0\u003e"}
 {"type":"log","level":"paxos","tag":"[s2]","msg":"PROMISE 3/3 for \u003c1,s2n0\u003e, quorum reached"}
 {"type":"log","level":"leader","tag":"[s2]","msg":"s2n0 leads s2 at \u003c1,s2n0\u003e"}
 {"type":"log","level":"paxos","tag":"[s0]","msg":"PROMISE 3/3 for \u003c1,s0n0\u003e, quorum reached"}
 {"type":"log","level":"leader","tag":"[s0]","msg":"s0n0 leads s0 at \u003c1,s0n0\u003e"}
-{"type":"log","level":"paxos","tag":"[s1]","msg":"PROMISE 3/3 for \u003c1,s1n0\u003e, quorum reached"}
-{"type":"log","level":"leader","tag":"[s1]","msg":"s1n0 leads s1 at \u003c1,s1n0\u003e"}
 {"type":"result","msg":"OK cluster up, 3/3 shards led"}
 {"type":"narr","msg":"a fresh cluster: 3 shards, 3 replicas each. a majority is 2."}
 {"type":"cmd","msg":"status"}
@@ -52,10 +52,10 @@
 {"type":"log","level":"twopc","tag":"[2PC]","msg":"BEGIN tx1: tushar(s2) -\u003e varun(s1) amount 25"}
 {"type":"log","level":"paxos","tag":"[s1]","msg":"ACCEPT slot=2 \u003c1,s1n0\u003e prepare tx1 varun+25"}
 {"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPT slot=4 \u003c1,s2n0\u003e prepare tx1 tushar-25"}
-{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPTED 3/3, value chosen"}
 {"type":"log","level":"paxos","tag":"[s1]","msg":"ACCEPTED 3/3, value chosen"}
-{"type":"log","level":"paxos","tag":"[s1]","msg":"COMMIT slot=2 prepare tx1 varun+25"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPTED 3/3, value chosen"}
 {"type":"log","level":"paxos","tag":"[s2]","msg":"COMMIT slot=4 prepare tx1 tushar-25"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"COMMIT slot=2 prepare tx1 varun+25"}
 {"type":"log","level":"twopc","tag":"[2PC]","msg":"s2 votes YES"}
 {"type":"log","level":"twopc","tag":"[2PC]","msg":"s1 votes YES"}
 {"type":"log","level":"twopc","tag":"[2PC]","msg":"COMMIT tx1: both shards voted yes"}
@@ -63,8 +63,8 @@
 {"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPT slot=5 \u003c1,s2n0\u003e commit tx1"}
 {"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPTED 3/3, value chosen"}
 {"type":"log","level":"paxos","tag":"[s1]","msg":"ACCEPTED 3/3, value chosen"}
-{"type":"log","level":"paxos","tag":"[s1]","msg":"COMMIT slot=3 commit tx1"}
 {"type":"log","level":"paxos","tag":"[s2]","msg":"COMMIT slot=5 commit tx1"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"COMMIT slot=3 commit tx1"}
 {"type":"result","msg":"OK moved 25 from tushar to varun"}
 {"type":"narr","msg":"every replica holds the same entries, in the same order, under the same ballots."}
 {"type":"cmd","msg":"datastore"}
@@ -93,10 +93,10 @@
 {"type":"log","level":"twopc","tag":"[2PC]","msg":"BEGIN tx2: tushar(s2) -\u003e varun(s1) amount 10"}
 {"type":"log","level":"paxos","tag":"[s1]","msg":"ACCEPT slot=4 \u003c1,s1n0\u003e prepare tx2 varun+10"}
 {"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPT slot=6 \u003c2,s2n1\u003e prepare tx2 tushar-10"}
-{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPTED 2/3, value chosen"}
 {"type":"log","level":"paxos","tag":"[s1]","msg":"ACCEPTED 3/3, value chosen"}
-{"type":"log","level":"paxos","tag":"[s1]","msg":"COMMIT slot=4 prepare tx2 varun+10"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPTED 2/3, value chosen"}
 {"type":"log","level":"paxos","tag":"[s2]","msg":"COMMIT slot=6 prepare tx2 tushar-10"}
+{"type":"log","level":"paxos","tag":"[s1]","msg":"COMMIT slot=4 prepare tx2 varun+10"}
 {"type":"log","level":"twopc","tag":"[2PC]","msg":"s2 votes YES"}
 {"type":"log","level":"twopc","tag":"[2PC]","msg":"s1 votes YES"}
 {"type":"log","level":"twopc","tag":"[2PC]","msg":"COMMIT tx2: both shards voted yes"}
@@ -104,8 +104,8 @@
 {"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPT slot=7 \u003c2,s2n1\u003e commit tx2"}
 {"type":"log","level":"paxos","tag":"[s1]","msg":"ACCEPTED 3/3, value chosen"}
 {"type":"log","level":"paxos","tag":"[s2]","msg":"ACCEPTED 2/3, value chosen"}
-{"type":"log","level":"paxos","tag":"[s2]","msg":"COMMIT slot=7 commit tx2"}
 {"type":"log","level":"paxos","tag":"[s1]","msg":"COMMIT slot=5 commit tx2"}
+{"type":"log","level":"paxos","tag":"[s2]","msg":"COMMIT slot=7 commit tx2"}
 {"type":"result","msg":"OK moved 10 from tushar to varun"}
 {"type":"narr","msg":"two of three is still a majority, so that worked. kill a second replica."}
 {"type":"cmd","msg":"kill s2n1"}
@@ -155,8 +155,8 @@
 {"type":"log","level":"net","tag":"[net]","msg":"dropped Prepare s2n1 -\u003e s2n0 (partitioned)"}
 {"type":"log","level":"paxos","tag":"[s2]","msg":"PROMISE 1/3 for \u003c5,s2n1\u003e, short of quorum 2"}
 {"type":"log","level":"paxos","tag":"[s2]","msg":"PREPARE \u003c6,s2n2\u003e from s2n2"}
-{"type":"log","level":"net","tag":"[net]","msg":"dropped Prepare s2n2 -\u003e s2n0 (partitioned)"}
 {"type":"log","level":"net","tag":"[net]","msg":"dropped Prepare s2n2 -\u003e s2n1 (partitioned)"}
+{"type":"log","level":"net","tag":"[net]","msg":"dropped Prepare s2n2 -\u003e s2n0 (partitioned)"}
 {"type":"log","level":"paxos","tag":"[s2]","msg":"PROMISE 1/3 for \u003c6,s2n2\u003e, short of quorum 2"}
 {"type":"log","level":"leader","tag":"[s2]","msg":"s2 has no leader: shard s2: no leader (no replica could reach a quorum of promises)"}
 {"type":"result","msg":"OK network split into 3 groups"}
